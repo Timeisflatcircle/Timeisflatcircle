@@ -1,1 +1,2 @@
-demo of 
+I succeeded in intergrating git and ubuntu
+Hurray
