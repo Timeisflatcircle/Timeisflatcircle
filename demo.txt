@@ -1,2 +1,2 @@
 I succeeded in intergrating git and ubuntu
-Hurray
+Hurray Hurray
