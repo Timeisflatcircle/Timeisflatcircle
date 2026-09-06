@@ -1,0 +1,21 @@
+# Ignore virtual environments anywhere in the project
+venv/
+**/venv/
+env/
+**/env/
+__pycache__/
+*.py[cod]
+
+# Ignore secret keys
+.env
+*.env
+
+# Ignore downloaded reports and outputs
+data/downloads/
+outputs/
+*.pdf
+*.tmp
+
+# IDE
+.vscode/
+.idea/
