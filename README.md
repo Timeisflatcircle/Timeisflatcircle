@@ -1,1 +1,1 @@
-Agent that can help me find new 10X opportunities in market
+Agent that can help to find new 10X opportunities in market
