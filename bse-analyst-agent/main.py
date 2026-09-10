@@ -111,6 +111,7 @@ if __name__ == "__main__":
     cli.add_argument("--refresh", action="store_true", help="Refresh the NSE universe cache")
     cli.add_argument("--top", type=int, default=50, help="Stage-1 candidates or Stage-2 shortlist size")
     cli.add_argument("--deep-limit", type=int, default=20, help="Maximum Stage-1 candidates sent to deep analysis")
+    cli.add_argument("--no-live-filings", action="store_true", help="Disable live NSE corporate/PIT filing checks")
     cli.add_argument("--limit", type=int, help="Limit universe symbols for testing")
     cli.add_argument("--input-csv", default="./outputs/small_microcap_universe.csv", help="Stage-1 CSV for Stage 2")
     cli.add_argument("--price", type=float, help="Current share price for single-stock valuation")
@@ -118,6 +119,7 @@ if __name__ == "__main__":
     cli.add_argument("--target-pe", type=float, default=25.0, help="Target P/E multiple")
     cli.add_argument("--mos", type=float, default=20.0, help="Margin of safety percentage")
     args = cli.parse_args()
-    if args.deep_scan: run_deep_scan(input_csv=args.input_csv, top=args.top, deep_limit=args.deep_limit)
+    if args.deep_scan:
+        run_deep_scan(input_csv=args.input_csv, top=args.top, deep_limit=args.deep_limit, live_filings=not args.no_live_filings)
     elif args.scan: run_universe_scan(refresh=args.refresh, top=args.top, limit=args.limit)
     else: main(args.symbol, args.price, args.shares_cr, args.target_pe, args.mos)
