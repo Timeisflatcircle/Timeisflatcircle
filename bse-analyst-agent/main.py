@@ -1,159 +1,156 @@
+import argparse
+import json
 import os
 import sys
 import warnings
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Suppress minor SDK warnings
 warnings.filterwarnings("ignore", message=r".*automatic function calling \(AFC\).*")
-
-# Ensure root directory is always on sys.path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-
 load_dotenv()
 
 from src.nse_downloader import NSEDownloader
 from src.doc_parser import FinancialDocParser
-from src.financial_tools import calculate_fundamental_ratios
+from src.financial_tools import (
+    calculate_fundamental_ratios,
+    calculate_quality_score,
+    calculate_pe_valuation,
+)
 from src.agent import AnalysisOrchestrator
 
 
-def save_summary_to_notepad(symbol: str, forensics, calculated_ratios: dict, memo, output_dir: str = "./outputs") -> str:
-    """Writes the analysis result into a formatted text file for Notepad reference."""
+def save_summary_to_notepad(
+    symbol: str,
+    forensics,
+    calculated_ratios: dict,
+    quality_score: dict,
+    valuation: dict,
+    memo,
+    output_dir: str = "./outputs",
+) -> str:
     os.makedirs(output_dir, exist_ok=True)
-    
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"{symbol.upper()}_Investment_Summary_{timestamp}.txt"
-    filepath = os.path.join(output_dir, filename)
-
+    filepath = os.path.join(output_dir, f"{symbol.upper()}_Investment_Summary_{timestamp}.txt")
     divider = "=" * 70
-    sub_divider = "-" * 70
+    sub = "-" * 70
 
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(f"{divider}\n")
-        f.write(f"           ANNUAL REPORT INVESTMENT MEMO & SUMMARY\n")
+        f.write("           FIVE-YEAR EQUITY RESEARCH INVESTMENT MEMO\n")
         f.write(f"           Company: {symbol.upper()} | Date: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')}\n")
         f.write(f"{divider}\n\n")
-
-        # 1. Final Recommendation Box
         f.write(f"[FINAL VERDICT]: {memo.verdict.upper()}\n")
-        f.write(f"[CONVICTION SCORE]: {memo.conviction_score} / 10\n")
-        f.write(f"[GOVERNANCE STATUS]: {'CLEAN / PASSED' if memo.governance_clearance else 'RED FLAGS / FAILED'}\n\n")
+        f.write(f"[AI CONVICTION]: {memo.conviction_score} / 10\n")
+        f.write(f"[DETERMINISTIC QUALITY SCORE]: {quality_score['score_100']} / 100 ({quality_score['rating']})\n")
+        f.write(f"[GOVERNANCE]: {'PASSED' if memo.governance_clearance else 'FAILED / REVIEW'}\n\n")
 
-        # 2. Executive Thesis
-        f.write(f"{sub_divider}\n")
-        f.write("EXECUTIVE SUMMARY & THESIS:\n")
-        f.write(f"{sub_divider}\n")
-        f.write(f"{memo.executive_summary.strip()}\n\n")
+        f.write(f"{sub}\nEXECUTIVE THESIS\n{sub}\n{memo.executive_summary.strip()}\n\n")
 
-        # 3. Fundamental Metrics & Hurdles
-        f.write(f"{sub_divider}\n")
-        f.write("KEY CALCULATED FINANCIAL METRICS (Ind AS Normalized):\n")
-        f.write(f"{sub_divider}\n")
+        f.write(f"{sub}\nFIVE-YEAR FUNDAMENTALS\n{sub}\n")
         for metric, value in calculated_ratios.items():
             if metric != "hurdles_passed":
-                f.write(f"  • {metric:<28}: {value}\n")
-        
-        f.write("\nHurdle Checks:\n")
-        hurdles = calculated_ratios.get("hurdles_passed", {})
-        for check, passed in hurdles.items():
-            status = "PASS [✓]" if passed else "FAIL [X]"
-            f.write(f"  • {check.replace('_', ' ').title():<28}: {status}\n")
+                f.write(f"  • {metric:<30}: {value}\n")
+        f.write("\nHurdles:\n")
+        for check, passed in calculated_ratios.get("hurdles_passed", {}).items():
+            f.write(f"  • {check.replace('_', ' ').title():<30}: {'PASS [✓]' if passed else 'FAIL [X]'}\n")
         f.write("\n")
 
-        # 4. Forensic & Auditor Findings
-        f.write(f"{sub_divider}\n")
-        f.write("FORENSIC & GOVERNANCE AUDIT:\n")
-        f.write(f"{sub_divider}\n")
-        f.write(f"  • Audit Opinion Type        : {forensics.audit_opinion_type}\n")
-        f.write(f"  • Contingent Liability Risk  : {forensics.contingent_liability_risk}\n")
-        f.write(f"  • Related Party Risk         : {forensics.related_party_risk}\n")
-        
-        f.write("\n  Key Audit Matters (KAM):\n")
-        if forensics.key_audit_matters:
-            for kam in forensics.key_audit_matters:
-                f.write(f"    - {kam}\n")
+        f.write(f"{sub}\nDETERMINISTIC QUALITY SCORE\n{sub}\n")
+        for component, points in quality_score["components"].items():
+            f.write(f"  • {component.replace('_', ' ').title():<30}: {points:>2} / 20\n")
+        f.write(f"  TOTAL: {quality_score['score_100']} / 100\n\n")
+
+        f.write(f"{sub}\nVALUATION\n{sub}\n")
+        if valuation.get("available"):
+            for key, value in valuation.items():
+                if key != "available":
+                    f.write(f"  • {key.replace('_', ' ').title():<30}: {value}\n")
         else:
-            f.write("    - None specified.\n")
-
-        f.write("\n  Forensic Red Flags Identified:\n")
-        if forensics.forensic_red_flags:
-            for flag in forensics.forensic_red_flags:
-                f.write(f"    ! [ALERT] {flag}\n")
-        else:
-            f.write("    - None detected.\n")
+            f.write(f"  • Not calculated: {valuation.get('reason', 'Market price inputs not supplied.')}\n")
         f.write("\n")
 
-        # 5. Strengths & Catalysts
-        f.write(f"{sub_divider}\n")
-        f.write("KEY FINANCIAL STRENGTHS & MOATS:\n")
-        f.write(f"{sub_divider}\n")
-        for s in memo.financial_strengths:
-            f.write(f"  [+] {s}\n")
+        f.write(f"{sub}\nFORENSIC & GOVERNANCE AUDIT\n{sub}\n")
+        f.write(f"  • Audit Opinion             : {forensics.audit_opinion_type}\n")
+        f.write(f"  • Contingent Liability Risk : {forensics.contingent_liability_risk}\n")
+        f.write(f"  • Related Party Risk        : {forensics.related_party_risk}\n\n")
+        f.write("  Key Audit Matters:\n")
+        for item in forensics.key_audit_matters or ["None specified."]:
+            f.write(f"    - {item}\n")
+        f.write("\n  Forensic Red Flags:\n")
+        for item in forensics.forensic_red_flags or ["None detected."]:
+            f.write(f"    ! {item}\n")
         f.write("\n")
 
-        # 6. Critical Risks
-        f.write(f"{sub_divider}\n")
-        f.write("CRITICAL RISKS & DOWNSIDE TRIGGERS:\n")
-        f.write(f"{sub_divider}\n")
-        for r in memo.critical_risks:
-            f.write(f"  [-] {r}\n")
-        f.write("\n")
-        f.write(f"{divider}\n")
-        f.write("End of Report\n")
+        f.write(f"{sub}\nFINANCIAL STRENGTHS\n{sub}\n")
+        for item in memo.financial_strengths:
+            f.write(f"  [+] {item}\n")
+        f.write(f"\n{sub}\nCRITICAL RISKS\n{sub}\n")
+        for item in memo.critical_risks:
+            f.write(f"  [-] {item}\n")
+
+        f.write(f"\n{divider}\nEnd of Report\n")
 
     return filepath
 
 
-def main(symbol: str):
+def main(symbol: str, price: float | None = None, shares_cr: float | None = None, target_pe: float = 25.0, mos: float = 20.0):
     symbol = symbol.upper().strip()
     print(f"\n==========================================")
-    print(f" Starting NSE Analysis Agent | Symbol: {symbol}")
+    print(f" Starting V2 NSE Analysis Agent | {symbol}")
     print(f"==========================================\n")
-    
-    # 1. Download filing from NSE
+
     downloader = NSEDownloader()
     pdf_path = downloader.download_report(symbol)
     if not pdf_path:
-        print(f"[!] Could not download annual report for symbol {symbol}. Exiting.")
+        print(f"[!] Could not download annual report for {symbol}. Exiting.")
         sys.exit(1)
 
-    # 2. Parse high-conviction sections
-    print("\n[*] Extracting key sections with PyMuPDF...")
+    print("\n[*] Extracting audit, five-year statements and cash flow...")
     parser = FinancialDocParser(pdf_path)
     sections = parser.extract_critical_sections()
 
-    # 3. Agent Execution (Gemini)
-    orchestrator = AnalysisOrchestrator(model_name="gemini-3.6-flash")
-    
-    # Phase A: Forensic Audit
-    print("\n[*] Running Forensic Governance Audit...")
-    forensics = orchestrator.audit_forensics(
-        auditor_text=sections["auditor_report"],
-        notes_text=sections["notes"]
+    orchestrator = AnalysisOrchestrator()
+
+    print("\n[*] Running forensic governance audit...")
+    forensics = orchestrator.audit_forensics(sections["auditor_report"], sections["notes"])
+
+    print("[*] Extracting five-year financial history...")
+    history = orchestrator.extract_metrics_payload(sections["financial_statements"])
+    ratios = calculate_fundamental_ratios(history)
+
+    governance_clean = (
+        forensics.audit_opinion_type.lower().startswith("unmodified")
+        and forensics.contingent_liability_risk.lower().startswith("low")
+        and forensics.related_party_risk.lower().startswith("low")
+        and not forensics.forensic_red_flags
     )
+    quality = calculate_quality_score(ratios, governance_clean=governance_clean)
 
-    # Phase B: Quantitative Metrics & Math
-    print("\n[*] Extracting Statement Values & Computing Financial Ratios...")
-    raw_metrics = orchestrator.extract_metrics_payload(sections["financial_statements"])
-    calculated_ratios = calculate_fundamental_ratios(raw_metrics)
+    valuation = {"available": False, "reason": "Supply --price and --shares-cr to calculate P/E fair value."}
+    if price is not None and shares_cr is not None:
+        valuation = calculate_pe_valuation(
+            current_price=price,
+            shares_outstanding_cr=shares_cr,
+            latest_pat_cr=history.years[-1].pat,
+            pat_cagr_pct=ratios["PAT CAGR (%)"],
+            target_pe=target_pe,
+            margin_of_safety_pct=mos,
+        )
 
-    # Phase C: Final Committee Verdict
-    print("\n[*] Convening Investment Committee...")
-    memo = orchestrator.run_investment_committee(forensics, calculated_ratios)
-    
-    # Print quick terminal summary
-    print("\n" + "=" * 55)
-    print(f"FINAL VERDICT: {memo.verdict.upper()} (Conviction: {memo.conviction_score}/10)")
-    print(f"Governance Clearance: {'PASSED' if memo.governance_clearance else 'FAILED'}")
-    print("=" * 55)
+    print("[*] Convening investment committee...")
+    memo = orchestrator.run_investment_committee(forensics, ratios, quality, valuation)
 
-    # 4. Save to Summary Notepad file
-    saved_file = save_summary_to_notepad(symbol, forensics, calculated_ratios, memo)
-    print(f"\n[+] Summary file saved successfully:")
-    print(f"    --> {saved_file}")
+    print("\n" + "=" * 60)
+    print(f"FINAL VERDICT: {memo.verdict.upper()} | AI CONVICTION: {memo.conviction_score}/10")
+    print(f"QUALITY SCORE: {quality['score_100']}/100 ({quality['rating']})")
+    if valuation.get("available"):
+        print(f"FAIR VALUE: ₹{valuation['fair_value']} | BUY BELOW: ₹{valuation['buy_below']}")
+    print("=" * 60)
 
-    # Optional: Automatically open it in Notepad on Windows
+    saved_file = save_summary_to_notepad(symbol, forensics, ratios, quality, valuation, memo)
+    print(f"\n[+] Summary saved: {saved_file}")
+
     try:
         os.system(f'notepad "{saved_file}"')
     except Exception:
@@ -161,5 +158,11 @@ def main(symbol: str):
 
 
 if __name__ == "__main__":
-    target_symbol = sys.argv[1] if len(sys.argv) > 1 else "TCS"
-    main(target_symbol)
+    parser = argparse.ArgumentParser(description="Five-year Indian equity research agent")
+    parser.add_argument("symbol", nargs="?", default="TCS", help="NSE symbol, e.g. TCS")
+    parser.add_argument("--price", type=float, help="Current share price in INR for valuation")
+    parser.add_argument("--shares-cr", type=float, help="Current shares outstanding in crore shares")
+    parser.add_argument("--target-pe", type=float, default=25.0, help="Target P/E multiple for fair value")
+    parser.add_argument("--mos", type=float, default=20.0, help="Margin of safety percentage")
+    args = parser.parse_args()
+    main(args.symbol, args.price, args.shares_cr, args.target_pe, args.mos)
