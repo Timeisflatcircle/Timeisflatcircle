@@ -81,3 +81,25 @@ def test_quote_fallback_enriches_market_cap(monkeypatch):
 
     assert row["market_cap_cr"] == 1720000.0
     assert row["source"] == "Yahoo Finance chart + Yahoo Finance quote fallback"
+
+
+def test_quote_uses_bulk_market_cap_override_without_second_market_cap_request(monkeypatch):
+    universe = NSEUniverse()
+    monkeypatch.setattr(universe, "_init_session", lambda: (_ for _ in ()).throw(RuntimeError("NSE blocked")))
+    monkeypatch.setattr(universe, "_yahoo_quote", lambda symbol: {
+        "symbol": symbol,
+        "company_name": "Reliance Industries Limited",
+        "price": 1274.0,
+        "market_cap_cr": None,
+        "avg_daily_value_cr": 1183.6,
+        "volume": 9290437.0,
+        "source": "Yahoo Finance chart fallback",
+    })
+    called = []
+    monkeypatch.setattr(universe, "_yahoo_market_caps", lambda symbols: called.append(symbols) or {"RELIANCE": 1720000.0})
+
+    row = universe.quote("RELIANCE", market_cap_override=1720000.0)
+
+    assert row["market_cap_cr"] == 1720000.0
+    assert row["source"] == "Yahoo Finance chart + market-cap cache"
+    assert called == []
