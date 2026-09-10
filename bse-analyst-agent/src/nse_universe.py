@@ -1,10 +1,9 @@
 """Automatic NSE equity universe discovery for the small/micro-cap scanner.
 
 Uses NSE's public equity master for symbols. For live price/liquidity/market-cap
-fields, NSE's quote-equity endpoint is attempted first, but the scanner also
-supports a Yahoo Finance chart fallback because NSE and Yahoo quote endpoints
-may reject automated quote requests. The chart endpoint provides current price
-and volume without the Yahoo quote-endpoint authentication flow.
+fields, NSE's quote-equity endpoint is attempted first. When NSE blocks
+automated quote access, Yahoo Finance is used as a fallback: chart provides
+price/volume and the authenticated quote endpoint provides market cap.
 """
 
 import csv
@@ -22,6 +21,9 @@ class NSEUniverse:
     QUOTE_URL = "https://www.nseindia.com/api/quote-equity"
     HOME_URL = "https://www.nseindia.com"
     YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
+    YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+    YAHOO_COOKIE_URL = "https://fc.yahoo.com"
+    YAHOO_CRUMB_URL = "https://query1.finance.yahoo.com/v1/test/getcrumb"
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -35,6 +37,7 @@ class NSEUniverse:
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
         self.initialized = False
+        self.yahoo_crumb: Optional[str] = None
 
     def _init_session(self) -> None:
         """Initialize an NSE web session when the homepage is accessible."""
@@ -47,14 +50,27 @@ class NSEUniverse:
         except requests.RequestException as exc:
             raise RuntimeError(f"NSE quote session unavailable: {exc}") from exc
 
+    def _init_yahoo_auth(self) -> None:
+        """Bootstrap the Yahoo cookie/crumb pair required by quote endpoints."""
+        if self.yahoo_crumb:
+            return
+        cookie_response = self.session.get(self.YAHOO_COOKIE_URL, timeout=15)
+        # Yahoo commonly returns 404 here while still setting the cookie.
+        if cookie_response.status_code not in (200, 404):
+            cookie_response.raise_for_status()
+        crumb_response = self.session.get(self.YAHOO_CRUMB_URL, timeout=15)
+        crumb_response.raise_for_status()
+        crumb = crumb_response.text.strip()
+        if not crumb:
+            raise requests.RequestException("Yahoo Finance returned an empty crumb")
+        self.yahoo_crumb = crumb
+
     def symbols(self, include_etfs: bool = False) -> List[str]:
         """Return active NSE equity symbols from the official equity master."""
         response = self.session.get(self.MASTER_URL, timeout=30)
         response.raise_for_status()
         text = response.content.decode("utf-8-sig", errors="replace")
 
-        # NSE's CSV currently contains whitespace in some header names
-        # (e.g. `` SERIES``). Normalize headers so field lookup is stable.
         reader = csv.DictReader(io.StringIO(text))
         reader.fieldnames = [
             field.strip().upper() if field else field
@@ -88,19 +104,13 @@ class NSEUniverse:
         return f"{symbol}.NS"
 
     def _yahoo_quote(self, symbol: str) -> Dict[str, Any]:
-        """Fetch one current quote from Yahoo Finance's chart endpoint."""
         data = self._yahoo_quotes([symbol])
         if symbol not in data:
             raise requests.RequestException(f"No Yahoo chart quote returned for {symbol}")
         return data[symbol]
 
     def _yahoo_quotes(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Fetch current price/volume using Yahoo's chart endpoint.
-
-        Yahoo's /v7/finance/quote endpoint now commonly returns 401 without
-        its authentication/crumb flow, while /v8/finance/chart exposes the
-        current market price and volume in the chart metadata.
-        """
+        """Fetch current price/volume using Yahoo's chart endpoint."""
         result: Dict[str, Dict[str, Any]] = {}
         for symbol in symbols:
             yahoo_symbol = self._yahoo_symbol(symbol)
@@ -112,8 +122,7 @@ class NSEUniverse:
             )
             response.raise_for_status()
             payload = response.json()
-            chart = payload.get("chart") or {}
-            chart_results = chart.get("result") or []
+            chart_results = (payload.get("chart") or {}).get("result") or []
             if not chart_results:
                 continue
 
@@ -124,15 +133,15 @@ class NSEUniverse:
                 meta.get("previousClose"),
                 meta.get("chartPreviousClose"),
             )
-            volume = None
-            indicators = data.get("indicators") or {}
-            quote_rows = indicators.get("quote") or []
-            if quote_rows:
-                volumes = quote_rows[0].get("volume") or []
-                for value in reversed(volumes):
-                    if value is not None:
-                        volume = self._first_number(value)
-                        break
+            volume = self._first_number(meta.get("regularMarketVolume"))
+            if volume is None:
+                quote_rows = ((data.get("indicators") or {}).get("quote") or [])
+                if quote_rows:
+                    volumes = quote_rows[0].get("volume") or []
+                    for value in reversed(volumes):
+                        if value is not None:
+                            volume = self._first_number(value)
+                            break
 
             traded_value_cr = (
                 price * volume / 1e7
@@ -143,13 +152,39 @@ class NSEUniverse:
                 "symbol": symbol,
                 "company_name": meta.get("longName") or meta.get("shortName") or symbol,
                 "price": price,
-                # Yahoo chart does not expose market cap. Keep this explicitly
-                # unknown rather than inventing a value.
                 "market_cap_cr": None,
                 "avg_daily_value_cr": traded_value_cr,
                 "volume": volume,
                 "source": "Yahoo Finance chart fallback",
             }
+        return result
+
+    def _yahoo_market_caps(self, symbols: List[str], batch_size: int = 100) -> Dict[str, float]:
+        """Fetch market caps in bulk using Yahoo's cookie/crumb-protected quote API."""
+        if not symbols:
+            return {}
+        self._init_yahoo_auth()
+        result: Dict[str, float] = {}
+        for start in range(0, len(symbols), batch_size):
+            batch = symbols[start:start + batch_size]
+            yahoo_symbols = [self._yahoo_symbol(symbol) for symbol in batch]
+            response = self.session.get(
+                self.YAHOO_QUOTE_URL,
+                params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            quote_rows = ((payload.get("quoteResponse") or {}).get("result") or [])
+            for quote in quote_rows:
+                yahoo_symbol = quote.get("symbol")
+                if not yahoo_symbol or not yahoo_symbol.endswith(".NS"):
+                    continue
+                market_cap = self._first_number(quote.get("marketCap"))
+                if market_cap is not None:
+                    result[yahoo_symbol[:-3]] = market_cap / 1e7
+            if start + batch_size < len(symbols):
+                time.sleep(self.request_delay)
         return result
 
     def quote(self, symbol: str) -> Dict[str, Any]:
@@ -200,7 +235,15 @@ class NSEUniverse:
                 "source": "NSE quote-equity",
             }
         except (requests.RequestException, RuntimeError):
-            return self._yahoo_quote(symbol)
+            quote = self._yahoo_quote(symbol)
+            try:
+                market_caps = self._yahoo_market_caps([symbol])
+                quote["market_cap_cr"] = market_caps.get(symbol)
+                quote["source"] = "Yahoo Finance chart + quote fallback"
+            except requests.RequestException:
+                # Keep market cap explicitly unknown rather than guessing.
+                quote["market_cap_cr"] = None
+            return quote
 
     def discover(self, limit: Optional[int] = None, refresh: bool = False) -> List[Dict[str, Any]]:
         """Build a current market universe using quote fallback when needed."""
