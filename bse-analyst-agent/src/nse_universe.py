@@ -1,9 +1,9 @@
 """Automatic NSE equity universe discovery for the small/micro-cap scanner.
 
-Uses NSE's public equity master for symbols. For live price/liquidity/market-cap
-fields, NSE's quote-equity endpoint is attempted first. When NSE blocks
-automated quote access, Yahoo Finance is used as a fallback: chart provides
-price/volume and authenticated Yahoo endpoints provide market cap.
+Uses NSE's public equity master for symbols. Live price/liquidity comes from
+NSE when available and Yahoo Finance chart otherwise. Market cap is separated
+into a bulk, TTL-based cache so a full universe scan does not make one market-
+cap request per symbol.
 """
 
 import csv
@@ -14,6 +14,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+
+from src.market_cap_cache import MarketCapCache
 
 
 class NSEUniverse:
@@ -31,7 +33,8 @@ class NSEUniverse:
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    def __init__(self, cache_dir: str = "./data/universe", request_delay: float = 0.25):
+    def __init__(self, cache_dir: str = "./data/universe", request_delay: float = 0.25,
+                 market_cap_cache: Optional[MarketCapCache] = None):
         self.cache_dir = cache_dir
         self.request_delay = request_delay
         os.makedirs(cache_dir, exist_ok=True)
@@ -39,9 +42,12 @@ class NSEUniverse:
         self.session.headers.update(self.HEADERS)
         self.initialized = False
         self.yahoo_crumb: Optional[str] = None
+        self.market_cap_cache = market_cap_cache or MarketCapCache(
+            cache_path=os.path.join(cache_dir, "market_caps.json"),
+            request_delay=request_delay,
+        )
 
     def _init_session(self) -> None:
-        """Initialize an NSE web session when the homepage is accessible."""
         if self.initialized:
             return
         try:
@@ -52,7 +58,6 @@ class NSEUniverse:
             raise RuntimeError(f"NSE quote session unavailable: {exc}") from exc
 
     def _init_yahoo_auth(self, force: bool = False) -> None:
-        """Bootstrap the Yahoo cookie/crumb pair required by quote endpoints."""
         if self.yahoo_crumb and not force:
             return
         self.yahoo_crumb = None
@@ -61,7 +66,6 @@ class NSEUniverse:
             headers={"Referer": "https://finance.yahoo.com/"},
             timeout=15,
         )
-        # Yahoo commonly returns 404 here while still setting the session cookie.
         if cookie_response.status_code not in (200, 404):
             cookie_response.raise_for_status()
         crumb_response = self.session.get(
@@ -76,17 +80,11 @@ class NSEUniverse:
         self.yahoo_crumb = crumb
 
     def symbols(self, include_etfs: bool = False) -> List[str]:
-        """Return active NSE equity symbols from the official equity master."""
         response = self.session.get(self.MASTER_URL, timeout=30)
         response.raise_for_status()
         text = response.content.decode("utf-8-sig", errors="replace")
-
         reader = csv.DictReader(io.StringIO(text))
-        reader.fieldnames = [
-            field.strip().upper() if field else field
-            for field in (reader.fieldnames or [])
-        ]
-
+        reader.fieldnames = [field.strip().upper() if field else field for field in (reader.fieldnames or [])]
         result: List[str] = []
         for row in reader:
             symbol = (row.get("SYMBOL") or "").strip().upper()
@@ -120,44 +118,27 @@ class NSEUniverse:
         return data[symbol]
 
     def _yahoo_quotes(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Fetch current price/volume using Yahoo's chart endpoint."""
         result: Dict[str, Dict[str, Any]] = {}
         for symbol in symbols:
-            yahoo_symbol = self._yahoo_symbol(symbol)
-            url = f"{self.YAHOO_CHART_URL}/{yahoo_symbol}"
-            response = self.session.get(
-                url,
-                params={"range": "1d", "interval": "1d"},
-                timeout=20,
-            )
+            url = f"{self.YAHOO_CHART_URL}/{self._yahoo_symbol(symbol)}"
+            response = self.session.get(url, params={"range": "1d", "interval": "1d"}, timeout=20)
             response.raise_for_status()
             payload = response.json()
             chart_results = (payload.get("chart") or {}).get("result") or []
             if not chart_results:
                 continue
-
             data = chart_results[0]
             meta = data.get("meta") or {}
-            price = self._first_number(
-                meta.get("regularMarketPrice"),
-                meta.get("previousClose"),
-                meta.get("chartPreviousClose"),
-            )
+            price = self._first_number(meta.get("regularMarketPrice"), meta.get("previousClose"), meta.get("chartPreviousClose"))
             volume = self._first_number(meta.get("regularMarketVolume"))
             if volume is None:
                 quote_rows = ((data.get("indicators") or {}).get("quote") or [])
                 if quote_rows:
-                    volumes = quote_rows[0].get("volume") or []
-                    for value in reversed(volumes):
+                    for value in reversed(quote_rows[0].get("volume") or []):
                         if value is not None:
                             volume = self._first_number(value)
                             break
-
-            traded_value_cr = (
-                price * volume / 1e7
-                if price is not None and volume is not None
-                else None
-            )
+            traded_value_cr = price * volume / 1e7 if price is not None and volume is not None else None
             result[symbol] = {
                 "symbol": symbol,
                 "company_name": meta.get("longName") or meta.get("shortName") or symbol,
@@ -170,7 +151,6 @@ class NSEUniverse:
         return result
 
     def _yahoo_market_caps(self, symbols: List[str], batch_size: int = 100) -> Dict[str, float]:
-        """Fetch market caps using Yahoo's authenticated quote endpoint."""
         if not symbols:
             return {}
         self._init_yahoo_auth()
@@ -181,39 +161,29 @@ class NSEUniverse:
             response = self.session.get(
                 self.YAHOO_QUOTE_URL,
                 params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb},
-                headers={"Referer": "https://finance.yahoo.com/"},
-                timeout=30,
+                headers={"Referer": "https://finance.yahoo.com/"}, timeout=30,
             )
             if response.status_code in (401, 403):
                 self._init_yahoo_auth(force=True)
                 response = self.session.get(
                     self.YAHOO_QUOTE_URL,
                     params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb},
-                    headers={"Referer": "https://finance.yahoo.com/"},
-                    timeout=30,
+                    headers={"Referer": "https://finance.yahoo.com/"}, timeout=30,
                 )
             response.raise_for_status()
-            payload = response.json()
-            quote_rows = ((payload.get("quoteResponse") or {}).get("result") or [])
-            for quote in quote_rows:
+            for quote in ((response.json().get("quoteResponse") or {}).get("result") or []):
                 yahoo_symbol = quote.get("symbol")
-                if not yahoo_symbol or not yahoo_symbol.endswith(".NS"):
-                    continue
                 market_cap = self._first_number(quote.get("marketCap"))
-                if market_cap is not None:
+                if yahoo_symbol and yahoo_symbol.endswith(".NS") and market_cap is not None:
                     result[yahoo_symbol[:-3]] = market_cap / 1e7
             if start + batch_size < len(symbols):
                 time.sleep(self.request_delay)
         return result
 
     def _yahoo_market_cap_summary(self, symbol: str) -> Optional[float]:
-        """Fetch market cap from Yahoo quoteSummary as a second authenticated fallback."""
         self._init_yahoo_auth()
         url = f"{self.YAHOO_SUMMARY_URL}/{self._yahoo_symbol(symbol)}"
-        params = {
-            "modules": "price,summaryDetail,defaultKeyStatistics",
-            "crumb": self.yahoo_crumb,
-        }
+        params = {"modules": "price,summaryDetail,defaultKeyStatistics", "crumb": self.yahoo_crumb}
         headers = {"Referer": "https://finance.yahoo.com/"}
         response = self.session.get(url, params=params, headers=headers, timeout=30)
         if response.status_code in (401, 403):
@@ -221,30 +191,27 @@ class NSEUniverse:
             params["crumb"] = self.yahoo_crumb
             response = self.session.get(url, params=params, headers=headers, timeout=30)
         response.raise_for_status()
-        payload = response.json()
-        result_rows = ((payload.get("quoteSummary") or {}).get("result") or [])
-        if not result_rows:
+        rows = ((response.json().get("quoteSummary") or {}).get("result") or [])
+        if not rows:
             return None
-        result = result_rows[0]
+        result = rows[0]
         for section in (result.get("price") or {}, result.get("summaryDetail") or {}, result.get("defaultKeyStatistics") or {}):
-            market_cap = section.get("marketCap") if isinstance(section, dict) else None
-            if isinstance(market_cap, dict):
-                market_cap = market_cap.get("raw")
-            market_cap = self._first_number(market_cap)
-            if market_cap is not None:
-                return market_cap / 1e7
+            value = section.get("marketCap") if isinstance(section, dict) else None
+            if isinstance(value, dict):
+                value = value.get("raw")
+            value = self._first_number(value)
+            if value is not None:
+                return value / 1e7
         return None
 
-    def quote(self, symbol: str) -> Dict[str, Any]:
-        """Fetch one quote, falling back when NSE blocks automated access."""
+    def quote(self, symbol: str, market_cap_override: Optional[float] = None) -> Dict[str, Any]:
         symbol = symbol.strip().upper()
         try:
             self._init_session()
-            headers = {"Referer": "https://www.nseindia.com/market-data/live-equity-market"}
             response = self.session.get(
                 self.QUOTE_URL,
                 params={"symbol": symbol},
-                headers=headers,
+                headers={"Referer": "https://www.nseindia.com/market-data/live-equity-market"},
                 timeout=20,
             )
             response.raise_for_status()
@@ -253,37 +220,29 @@ class NSEUniverse:
             security_info = data.get("securityInfo") or {}
             metadata = data.get("metadata") or {}
             trade_info = data.get("marketDeptOrderBook") or {}
-
             price = self._first_number(price_info.get("lastPrice"), data.get("lastPrice"))
-            traded_value = self._first_number(
-                price_info.get("totalTradedValue"),
-                data.get("totalTradedValue"),
-                trade_info.get("tradeInfo", {}).get("totalTradedValue"),
-            )
+            traded_value = self._first_number(price_info.get("totalTradedValue"), data.get("totalTradedValue"), trade_info.get("tradeInfo", {}).get("totalTradedValue"))
             traded_value_cr = traded_value / 1e7 if traded_value is not None and traded_value > 10000 else traded_value
-            market_cap = self._first_number(
-                data.get("marketCap"),
-                security_info.get("marketCap"),
-                metadata.get("marketCap"),
-            )
-            issued_size = self._first_number(
-                security_info.get("issuedSize"),
-                metadata.get("issuedSize"),
-                data.get("issuedSize"),
-            )
+            market_cap = self._first_number(data.get("marketCap"), security_info.get("marketCap"), metadata.get("marketCap"))
+            issued_size = self._first_number(security_info.get("issuedSize"), metadata.get("issuedSize"), data.get("issuedSize"))
             if market_cap is None and issued_size is not None and price is not None:
                 market_cap = price * issued_size / 100.0
-
+            if market_cap is None:
+                market_cap = market_cap_override
             return {
                 "symbol": symbol,
                 "company_name": metadata.get("companyName") or data.get("companyName") or symbol,
                 "price": price,
                 "market_cap_cr": market_cap,
                 "avg_daily_value_cr": traded_value_cr,
-                "source": "NSE quote-equity",
+                "source": "NSE quote-equity" if market_cap_override is None or market_cap is not market_cap_override else "NSE quote-equity + market-cap cache",
             }
         except (requests.RequestException, RuntimeError):
             quote = self._yahoo_quote(symbol)
+            if market_cap_override is not None:
+                quote["market_cap_cr"] = market_cap_override
+                quote["source"] = "Yahoo Finance chart + market-cap cache"
+                return quote
             market_cap_source = None
             try:
                 market_caps = self._yahoo_market_caps([symbol])
@@ -295,14 +254,10 @@ class NSEUniverse:
                     market_cap_source = "Yahoo Finance quoteSummary"
                 except requests.RequestException:
                     quote["market_cap_cr"] = None
-            if quote["market_cap_cr"] is not None:
-                quote["source"] = f"Yahoo Finance chart + {market_cap_source} fallback"
-            else:
-                quote["source"] = "Yahoo Finance chart fallback (market cap unavailable)"
+            quote["source"] = f"Yahoo Finance chart + {market_cap_source} fallback" if quote["market_cap_cr"] is not None else "Yahoo Finance chart fallback (market cap unavailable)"
             return quote
 
     def discover(self, limit: Optional[int] = None, refresh: bool = False) -> List[Dict[str, Any]]:
-        """Build a current market universe using quote fallback when needed."""
         cache_path = os.path.join(self.cache_dir, "nse_universe.json")
         if os.path.exists(cache_path) and not refresh:
             with open(cache_path, "r", encoding="utf-8") as fh:
@@ -312,11 +267,16 @@ class NSEUniverse:
         if limit:
             symbols = symbols[:limit]
 
+        # One bulk request when cache is stale/missing; subsequent per-symbol
+        # quote calls only retrieve price/liquidity and reuse the cached market cap.
+        market_caps = self.market_cap_cache.ensure_fresh(symbols)
         rows: List[Dict[str, Any]] = []
         failures = 0
         for idx, symbol in enumerate(symbols, 1):
             try:
-                rows.append(self.quote(symbol))
+                cached = market_caps.get(symbol, {}).get("market_cap_cr")
+                override = float(cached) if cached is not None else None
+                rows.append(self.quote(symbol, market_cap_override=override))
             except (requests.RequestException, RuntimeError, ValueError, TypeError, KeyError):
                 failures += 1
             if idx < len(symbols):
