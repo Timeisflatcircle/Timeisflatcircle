@@ -2,7 +2,7 @@ name: BSE Analyst Agent Tests
 
 on:
   push:
-    branches: [main, v2-equity-analysis]
+    branches: [main, v2-equity-analysis, v3-final]
   pull_request:
     branches: [main]
 
