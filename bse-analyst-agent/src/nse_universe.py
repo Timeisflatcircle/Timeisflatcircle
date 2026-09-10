@@ -48,7 +48,16 @@ class NSEUniverse:
         response = self.session.get(self.MASTER_URL, timeout=30)
         response.raise_for_status()
         text = response.content.decode("utf-8-sig", errors="replace")
-        rows = csv.DictReader(io.StringIO(text))
+
+        # NSE's CSV currently contains whitespace in some header names
+        # (e.g. `` SERIES``). Normalize headers so field lookup is stable.
+        reader = csv.DictReader(io.StringIO(text))
+        reader.fieldnames = [
+            field.strip().upper() if field else field
+            for field in (reader.fieldnames or [])
+        ]
+        rows = reader
+
         result: List[str] = []
         for row in rows:
             symbol = (row.get("SYMBOL") or "").strip().upper()
