@@ -99,7 +99,8 @@ def calculate_microcap_risk_score(row: Dict[str, Any], config: SmallMicrocapConf
         flags.append("AUDIT_QUALIFICATION")
 
     hard_fail = any(flag in flags for flag in ("AUDIT_QUALIFICATION", "HIGH_PROMOTER_PLEDGE", "HIGH_RELATED_PARTY_RISK"))
-    risk_band = "A" if score >= 80 and not hard_fail else "B" if score >= 65 and not hard_fail else "C" if score >= 50 else "D"
+    # Hard failures always map to the worst risk band, regardless of the raw score.
+    risk_band = "D" if hard_fail else "A" if score >= 80 else "B" if score >= 65 else "C" if score >= 50 else "D"
     return {"risk_score_100": score, "risk_band": risk_band, "flags": flags, "hard_fail": hard_fail}
 
 
