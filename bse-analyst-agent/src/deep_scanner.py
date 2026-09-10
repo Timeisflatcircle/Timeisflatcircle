@@ -11,34 +11,65 @@ from src.financial_tools import (
     determine_final_recommendation,
 )
 from src.agent import AnalysisOrchestrator
-from src.corporate_risk import assess_corporate_risk
+from src.corporate_risk import assess_corporate_risk, extract_announcements_from_rows
+from src.nse_corporate_filings import NSECorporateFilings
 
 
-def analyze_candidate(row: Dict[str, Any], orchestrator: AnalysisOrchestrator | None = None) -> Dict[str, Any]:
+def analyze_candidate(
+    row: Dict[str, Any],
+    orchestrator: AnalysisOrchestrator | None = None,
+    filings_client: NSECorporateFilings | None = None,
+    live_filings: bool = True,
+) -> Dict[str, Any]:
     symbol = str(row.get("symbol", "")).strip().upper()
     if not symbol:
         return {**row, "status": "ERROR", "error": "Missing symbol"}
 
-    corporate = assess_corporate_risk(
-        promoter_holding_pct=row.get("promoter_holding_pct"),
-        promoter_pledge_pct=row.get("promoter_pledge_pct"),
-        promoter_change_pct=row.get("promoter_change_pct"),
-        auditor_status=row.get("auditor_status"),
-        related_party_risk=row.get("related_party_risk"),
-    )
-    if corporate.hard_fail:
-        return {
-            **row,
-            "status": "CORPORATE_RISK_REJECT",
-            "verdict": "AVOID",
-            "corporate_risk_score": corporate.risk_score,
-            "governance_grade": corporate.governance_grade,
-            "corporate_risk_flags": ";".join(corporate.risk_flags),
-            "corporate_data_gaps": ";".join(corporate.data_gaps),
-            "error": "Rejected before deep analysis due to a hard corporate-risk signal",
-        }
-
     try:
+        filing_data: dict[str, Any] = {"announcements": [], "pit_risk_rows": [], "shareholding": {}}
+        if live_filings:
+            client = filings_client or NSECorporateFilings()
+            filing_data = client.cached_risk_inputs(symbol)
+
+        # Prefer live exchange shareholding data over stale/missing Stage-1 fields.
+        promoter_holding = filing_data.get("promoter_holding_pct")
+        promoter_pledge = filing_data.get("promoter_pledge_pct")
+        promoter_change = filing_data.get("promoter_change_pct")
+        if promoter_holding is None:
+            promoter_holding = row.get("promoter_holding_pct")
+        if promoter_pledge is None:
+            promoter_pledge = row.get("promoter_pledge_pct")
+        if promoter_change is None:
+            promoter_change = row.get("promoter_change_pct")
+
+        corporate = assess_corporate_risk(
+            promoter_holding_pct=promoter_holding,
+            promoter_pledge_pct=promoter_pledge,
+            promoter_change_pct=promoter_change,
+            auditor_status=row.get("auditor_status"),
+            related_party_risk=row.get("related_party_risk"),
+            announcements=extract_announcements_from_rows(
+                [*filing_data.get("announcements", []), *filing_data.get("pit_risk_rows", [])]
+            ),
+        )
+        if corporate.hard_fail:
+            return {
+                **row,
+                "status": "CORPORATE_RISK_REJECT",
+                "verdict": "AVOID",
+                "corporate_risk_score": corporate.risk_score,
+                "governance_grade": corporate.governance_grade,
+                "corporate_risk_flags": ";".join(corporate.risk_flags),
+                "corporate_data_gaps": ";".join(corporate.data_gaps),
+                "promoter_holding_pct": promoter_holding,
+                "promoter_pledge_pct": promoter_pledge,
+                "promoter_change_pct": promoter_change,
+                "shareholding_as_on": filing_data.get("shareholding", {}).get("as_on_date"),
+                "shareholding_xbrl_url": filing_data.get("shareholding", {}).get("xbrl_url"),
+                "filing_source": filing_data.get("source", "NSE"),
+                "error": "Rejected before deep analysis due to a hard corporate-risk signal",
+            }
+
         pdf_path = NSEDownloader().download_report(symbol)
         if not pdf_path:
             return {**row, "status": "NO_REPORT", "error": "Annual report unavailable"}
@@ -89,6 +120,12 @@ def analyze_candidate(row: Dict[str, Any], orchestrator: AnalysisOrchestrator | 
             "governance_grade": corporate.governance_grade,
             "corporate_risk_flags": ";".join(corporate.risk_flags),
             "corporate_data_gaps": ";".join(corporate.data_gaps),
+            "promoter_holding_pct": promoter_holding,
+            "promoter_pledge_pct": promoter_pledge,
+            "promoter_change_pct": promoter_change,
+            "shareholding_as_on": filing_data.get("shareholding", {}).get("as_on_date"),
+            "shareholding_xbrl_url": filing_data.get("shareholding", {}).get("xbrl_url"),
+            "filing_source": filing_data.get("source", "NSE"),
             "pat_cagr_pct": ratios.get("PAT CAGR (%)"),
             "revenue_cagr_pct": ratios.get("Revenue CAGR (%)"),
             "roce_pct": ratios.get("ROCE (%)"),
@@ -104,16 +141,22 @@ def analyze_candidate(row: Dict[str, Any], orchestrator: AnalysisOrchestrator | 
         return {**row, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
 
 
-def run_deep_scan(input_csv: str = "./outputs/small_microcap_universe.csv", top: int = 10, deep_limit: int = 20, output_dir: str = "./outputs") -> List[Dict[str, Any]]:
+def run_deep_scan(
+    input_csv: str = "./outputs/small_microcap_universe.csv",
+    top: int = 10,
+    deep_limit: int = 20,
+    output_dir: str = "./outputs",
+    live_filings: bool = True,
+) -> List[Dict[str, Any]]:
     if not os.path.exists(input_csv):
         raise FileNotFoundError(f"Stage-1 CSV not found: {input_csv}. Run --scan first.")
 
     with open(input_csv, newline="", encoding="utf-8") as fh:
-        rows = list(csv.DictReader(fh))
+        rows = list(csv.DictReader(fh))[:deep_limit]
 
-    rows = rows[:deep_limit]
     ai = AnalysisOrchestrator()
-    results = [analyze_candidate(row, ai) for row in rows]
+    filings = NSECorporateFilings() if live_filings else None
+    results = [analyze_candidate(row, ai, filings, live_filings=live_filings) for row in rows]
     analyzed = [r for r in results if r.get("status") == "ANALYZED"]
     analyzed.sort(key=lambda r: (r.get("verdict") == "BUY", float(r.get("quality_score") or 0), float(r.get("ai_conviction") or 0)), reverse=True)
     selected = analyzed[:top]
@@ -128,9 +171,10 @@ def run_deep_scan(input_csv: str = "./outputs/small_microcap_universe.csv", top:
 
     print(f"[+] Stage-2 candidates processed: {len(rows)}")
     print(f"[+] Stage-2 fully analyzed: {len(analyzed)}")
+    print(f"[+] Live NSE filing checks: {'ON' if live_filings else 'OFF'}")
     print(f"[+] Saved full deep-analysis results: {path}")
     print("\nTOP SMALL/MICRO-CAP RESEARCH SHORTLIST")
     print("-" * 110)
     for i, row in enumerate(selected, 1):
-        print(f"{i:>2}. {row['symbol']:<15} {row.get('market_cap_category',''):<9} {row.get('verdict',''):<10} Score {row.get('quality_score')}  PAT CAGR {row.get('pat_cagr_pct')}%  ROCE {row.get('roce_pct')}%  Fair ₹{row.get('fair_value')}")
+        print(f"{i:>2}. {row['symbol']:<15} {row.get('market_cap_category',''):<9} {row.get('verdict',''):<10} Score {row.get('quality_score')}  Gov {row.get('governance_grade')}  Fair ₹{row.get('fair_value')}")
     return selected
