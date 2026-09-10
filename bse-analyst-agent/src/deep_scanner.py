@@ -11,12 +11,32 @@ from src.financial_tools import (
     determine_final_recommendation,
 )
 from src.agent import AnalysisOrchestrator
+from src.corporate_risk import assess_corporate_risk
 
 
 def analyze_candidate(row: Dict[str, Any], orchestrator: AnalysisOrchestrator | None = None) -> Dict[str, Any]:
     symbol = str(row.get("symbol", "")).strip().upper()
     if not symbol:
         return {**row, "status": "ERROR", "error": "Missing symbol"}
+
+    corporate = assess_corporate_risk(
+        promoter_holding_pct=row.get("promoter_holding_pct"),
+        promoter_pledge_pct=row.get("promoter_pledge_pct"),
+        promoter_change_pct=row.get("promoter_change_pct"),
+        auditor_status=row.get("auditor_status"),
+        related_party_risk=row.get("related_party_risk"),
+    )
+    if corporate.hard_fail:
+        return {
+            **row,
+            "status": "CORPORATE_RISK_REJECT",
+            "verdict": "AVOID",
+            "corporate_risk_score": corporate.risk_score,
+            "governance_grade": corporate.governance_grade,
+            "corporate_risk_flags": ";".join(corporate.risk_flags),
+            "corporate_data_gaps": ";".join(corporate.data_gaps),
+            "error": "Rejected before deep analysis due to a hard corporate-risk signal",
+        }
 
     try:
         pdf_path = NSEDownloader().download_report(symbol)
@@ -36,6 +56,7 @@ def analyze_candidate(row: Dict[str, Any], orchestrator: AnalysisOrchestrator | 
             and forensics.contingent_liability_risk.lower().startswith("low")
             and forensics.related_party_risk.lower().startswith("low")
             and not forensics.forensic_red_flags
+            and corporate.governance_grade in {"A", "B"}
         )
         quality = calculate_quality_score(ratios, governance_clean=governance_clean)
 
@@ -64,6 +85,10 @@ def analyze_candidate(row: Dict[str, Any], orchestrator: AnalysisOrchestrator | 
             "quality_score": quality["score_100"],
             "ai_conviction": memo.conviction_score,
             "governance_clean": governance_clean,
+            "corporate_risk_score": corporate.risk_score,
+            "governance_grade": corporate.governance_grade,
+            "corporate_risk_flags": ";".join(corporate.risk_flags),
+            "corporate_data_gaps": ";".join(corporate.data_gaps),
             "pat_cagr_pct": ratios.get("PAT CAGR (%)"),
             "revenue_cagr_pct": ratios.get("Revenue CAGR (%)"),
             "roce_pct": ratios.get("ROCE (%)"),
@@ -79,13 +104,14 @@ def analyze_candidate(row: Dict[str, Any], orchestrator: AnalysisOrchestrator | 
         return {**row, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
 
 
-def run_deep_scan(input_csv: str = "./outputs/small_microcap_universe.csv", top: int = 10, output_dir: str = "./outputs") -> List[Dict[str, Any]]:
+def run_deep_scan(input_csv: str = "./outputs/small_microcap_universe.csv", top: int = 10, deep_limit: int = 20, output_dir: str = "./outputs") -> List[Dict[str, Any]]:
     if not os.path.exists(input_csv):
         raise FileNotFoundError(f"Stage-1 CSV not found: {input_csv}. Run --scan first.")
 
     with open(input_csv, newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
 
+    rows = rows[:deep_limit]
     ai = AnalysisOrchestrator()
     results = [analyze_candidate(row, ai) for row in rows]
     analyzed = [r for r in results if r.get("status") == "ANALYZED"]
@@ -100,7 +126,8 @@ def run_deep_scan(input_csv: str = "./outputs/small_microcap_universe.csv", top:
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"[+] Stage-2 analyzed: {len(analyzed)}/{len(rows)}")
+    print(f"[+] Stage-2 candidates processed: {len(rows)}")
+    print(f"[+] Stage-2 fully analyzed: {len(analyzed)}")
     print(f"[+] Saved full deep-analysis results: {path}")
     print("\nTOP SMALL/MICRO-CAP RESEARCH SHORTLIST")
     print("-" * 110)
