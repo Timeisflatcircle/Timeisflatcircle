@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
@@ -45,9 +45,6 @@ class NSECorporateFilings:
         if self.initialized:
             return
 
-        # The public filing pages are a more reliable bootstrap than the NSE
-        # homepage for this client. They also establish the cookies used by
-        # the filing API endpoints.
         for page in (self.ANNOUNCEMENTS_PAGE, self.SHAREHOLDING_PAGE):
             response = self.session.get(
                 page,
@@ -72,7 +69,7 @@ class NSECorporateFilings:
         response = self.session.get(
             url,
             params=params,
-            headers={"Referer": self.ANNOUNCEMENTS_PAGE},
+            headers={"Referer": self.SHAREHOLDING_PAGE if "share-holdings" in url else self.ANNOUNCEMENTS_PAGE},
             timeout=30,
         )
         response.raise_for_status()
@@ -123,8 +120,23 @@ class NSECorporateFilings:
 
         return walk(row)
 
+    @staticmethod
+    def _filing_date(row: dict[str, Any]) -> datetime:
+        value = NSECorporateFilings._find_value(
+            row,
+            ("asOnDate", "as_on_date", "asOn", "date", "submissionDate", "submission_date"),
+        )
+        if not value:
+            return datetime.min
+        text = str(value).strip()
+        for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return datetime.min
+
     def announcements(self, symbol: str, days: int = 180) -> list[dict[str, Any]]:
-        """Return recent NSE equity announcements for one symbol."""
         end = date.today()
         start = end - timedelta(days=max(1, days))
         data = self._get_json(
@@ -139,7 +151,6 @@ class NSECorporateFilings:
         return self._rows(data)
 
     def pit(self, symbol: str, days: int = 365) -> list[dict[str, Any]]:
-        """Return recent promoter/director/KMP trading disclosures where available."""
         end = date.today()
         start = end - timedelta(days=max(1, days))
         data = self._get_json(
@@ -168,41 +179,80 @@ class NSECorporateFilings:
                 "data_gap": "NSE shareholding pattern unavailable",
             }
 
-        def date_key(row: dict[str, Any]) -> str:
-            return str(
-                row.get("asOnDate")
-                or row.get("as_on_date")
-                or row.get("asOn")
-                or row.get("date")
-                or ""
-            )
-
-        ordered = sorted(rows, key=date_key, reverse=True)
+        ordered = sorted(rows, key=self._filing_date, reverse=True)
         latest = ordered[0]
         prior = ordered[1] if len(ordered) > 1 else None
 
+        # NSE's summary feed exposes these as promoter_val/public_val in some
+        # responses. Keep the broader aliases for other NSE schema variants.
         promoter = self._find_number(
             latest,
-            ("promoterAndPromoterGroup", "promoterGroup", "promoterHolding", "promoter", "promoterPct", "promoterPercent"),
+            (
+                "promoter_val",
+                "promoterVal",
+                "promoterAndPromoterGroup",
+                "promoterGroup",
+                "promoterHolding",
+                "promoter",
+                "promoterPct",
+                "promoterPercent",
+            ),
         )
         public = self._find_number(
             latest,
-            ("public", "publicHolding", "publicPct", "publicPercent"),
+            ("public_val", "publicVal", "public", "publicHolding", "publicPct", "publicPercent"),
         )
+
+        # The NSE summary is explicitly a percentage split. When the direct
+        # promoter field is absent, derive it only from public + employee-trust
+        # percentages so the calculation remains faithful to the displayed
+        # A+B+C2 denominator.
+        employee_trust = self._find_number(
+            latest,
+            ("employeeTrust_val", "employeeTrustVal", "employeeTrust", "employeeTrustPct", "employeeTrustPercent"),
+        )
+        if promoter is None and public is not None:
+            promoter = round(100.0 - public - (employee_trust or 0.0), 4)
+
         pledge = self._find_number(
             latest,
             ("promoterPledge", "promoterPledgePct", "pledged", "pledgedSharesPct", "encumbered", "encumberedPct"),
         )
         prior_promoter = self._find_number(
             prior or {},
-            ("promoterAndPromoterGroup", "promoterGroup", "promoterHolding", "promoter", "promoterPct", "promoterPercent"),
+            (
+                "promoter_val",
+                "promoterVal",
+                "promoterAndPromoterGroup",
+                "promoterGroup",
+                "promoterHolding",
+                "promoter",
+                "promoterPct",
+                "promoterPercent",
+            ),
         )
-        promoter_change = promoter - prior_promoter if promoter is not None and prior_promoter is not None else None
+        prior_public = self._find_number(
+            prior or {},
+            ("public_val", "publicVal", "public", "publicHolding", "publicPct", "publicPercent"),
+        )
+        if prior_promoter is None and prior_public is not None:
+            prior_employee = self._find_number(
+                prior or {},
+                ("employeeTrust_val", "employeeTrustVal", "employeeTrust", "employeeTrustPct", "employeeTrustPercent"),
+            )
+            prior_promoter = round(100.0 - prior_public - (prior_employee or 0.0), 4)
 
+        promoter_change = (
+            round(promoter - prior_promoter, 4)
+            if promoter is not None and prior_promoter is not None
+            else None
+        )
+
+        as_on_date = self._find_value(latest, ("asOnDate", "as_on_date", "asOn", "date"))
         return {
             "symbol": symbol.upper().strip(),
             "available": True,
-            "as_on_date": date_key(latest),
+            "as_on_date": as_on_date,
             "submission_date": self._find_value(latest, ("submissionDate", "submission_date", "filedDate")),
             "broadcast_date": self._find_value(latest, ("broadcastDate", "broadcast_date")),
             "xbrl_url": self._find_value(latest, ("xbrl", "xbrlUrl", "xbrlFileLink", "xbrlFile")),
@@ -234,7 +284,6 @@ class NSECorporateFilings:
         }
 
     def risk_inputs(self, symbol: str, days: int = 180) -> dict[str, Any]:
-        """Collect mechanical filing signals for corporate-risk assessment."""
         try:
             announcements = self.announcements(symbol, days=days)
             pit_rows = self.pit(symbol, days=max(days, 365))
