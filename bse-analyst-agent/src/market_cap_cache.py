@@ -81,6 +81,13 @@ class MarketCapCache:
             json.dump(payload, fh, indent=2, sort_keys=True)
         os.replace(tmp, self.cache_path)
 
+    def _is_fresh(self, row: Dict[str, object]) -> bool:
+        try:
+            age_hours = (time.time() - time.mktime(time.strptime(str(row["as_of"]), "%Y-%m-%dT%H:%M:%S"))) / 3600
+            return age_hours <= self.ttl_hours and row.get("market_cap_cr") is not None
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+
     def _fetch_batch(self, symbols: List[str]) -> Dict[str, Dict[str, object]]:
         self._auth()
         yahoo_symbols = [self._symbol(s) for s in symbols]
@@ -136,21 +143,24 @@ class MarketCapCache:
         self._save(data)
         return data
 
+    def ensure_fresh(self, symbols: List[str]) -> Dict[str, Dict[str, object]]:
+        """Refresh the whole requested universe only when a value is stale/missing."""
+        normalized = sorted({s.strip().upper() for s in symbols if s and s.strip()})
+        data = self._load()
+        if all(self._is_fresh(data.get(symbol, {})) for symbol in normalized):
+            return data
+        return self.refresh(normalized)
+
     def get(self, symbol: str, refresh_if_stale: bool = False, universe: Optional[List[str]] = None) -> Optional[float]:
         """Return cached market cap in INR crore; optionally refresh stale cache."""
         key = symbol.strip().upper()
         data = self._load()
         row = data.get(key)
-        if row:
-            try:
-                age_hours = (time.time() - time.mktime(time.strptime(row["as_of"], "%Y-%m-%dT%H:%M:%S"))) / 3600
-                if age_hours <= self.ttl_hours:
-                    return float(row["market_cap_cr"])
-            except (KeyError, TypeError, ValueError, OverflowError):
-                pass
+        if row and self._is_fresh(row):
+            return float(row["market_cap_cr"])
         if refresh_if_stale and universe:
-            data = self.refresh(universe)
+            data = self.ensure_fresh(universe)
             row = data.get(key)
-            if row:
+            if row and self._is_fresh(row):
                 return float(row["market_cap_cr"])
         return None
