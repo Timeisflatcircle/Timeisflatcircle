@@ -3,7 +3,7 @@
 Uses NSE's public equity master for symbols. For live price/liquidity/market-cap
 fields, NSE's quote-equity endpoint is attempted first. When NSE blocks
 automated quote access, Yahoo Finance is used as a fallback: chart provides
-price/volume and the authenticated quote endpoint provides market cap.
+price/volume and authenticated Yahoo endpoints provide market cap.
 """
 
 import csv
@@ -22,6 +22,7 @@ class NSEUniverse:
     HOME_URL = "https://www.nseindia.com"
     YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
     YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+    YAHOO_SUMMARY_URL = "https://query1.finance.yahoo.com/v10/finance/quoteSummary"
     YAHOO_COOKIE_URL = "https://fc.yahoo.com"
     YAHOO_CRUMB_URL = "https://query1.finance.yahoo.com/v1/test/getcrumb"
     HEADERS = {
@@ -50,19 +51,28 @@ class NSEUniverse:
         except requests.RequestException as exc:
             raise RuntimeError(f"NSE quote session unavailable: {exc}") from exc
 
-    def _init_yahoo_auth(self) -> None:
+    def _init_yahoo_auth(self, force: bool = False) -> None:
         """Bootstrap the Yahoo cookie/crumb pair required by quote endpoints."""
-        if self.yahoo_crumb:
+        if self.yahoo_crumb and not force:
             return
-        cookie_response = self.session.get(self.YAHOO_COOKIE_URL, timeout=15)
-        # Yahoo commonly returns 404 here while still setting the cookie.
+        self.yahoo_crumb = None
+        cookie_response = self.session.get(
+            self.YAHOO_COOKIE_URL,
+            headers={"Referer": "https://finance.yahoo.com/"},
+            timeout=15,
+        )
+        # Yahoo commonly returns 404 here while still setting the session cookie.
         if cookie_response.status_code not in (200, 404):
             cookie_response.raise_for_status()
-        crumb_response = self.session.get(self.YAHOO_CRUMB_URL, timeout=15)
+        crumb_response = self.session.get(
+            self.YAHOO_CRUMB_URL,
+            headers={"Referer": "https://finance.yahoo.com/"},
+            timeout=15,
+        )
         crumb_response.raise_for_status()
         crumb = crumb_response.text.strip()
-        if not crumb:
-            raise requests.RequestException("Yahoo Finance returned an empty crumb")
+        if not crumb or "Unauthorized" in crumb:
+            raise requests.RequestException("Yahoo Finance returned an invalid crumb")
         self.yahoo_crumb = crumb
 
     def symbols(self, include_etfs: bool = False) -> List[str]:
@@ -160,7 +170,7 @@ class NSEUniverse:
         return result
 
     def _yahoo_market_caps(self, symbols: List[str], batch_size: int = 100) -> Dict[str, float]:
-        """Fetch market caps in bulk using Yahoo's cookie/crumb-protected quote API."""
+        """Fetch market caps using Yahoo's authenticated quote endpoint."""
         if not symbols:
             return {}
         self._init_yahoo_auth()
@@ -171,8 +181,17 @@ class NSEUniverse:
             response = self.session.get(
                 self.YAHOO_QUOTE_URL,
                 params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb},
+                headers={"Referer": "https://finance.yahoo.com/"},
                 timeout=30,
             )
+            if response.status_code in (401, 403):
+                self._init_yahoo_auth(force=True)
+                response = self.session.get(
+                    self.YAHOO_QUOTE_URL,
+                    params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb},
+                    headers={"Referer": "https://finance.yahoo.com/"},
+                    timeout=30,
+                )
             response.raise_for_status()
             payload = response.json()
             quote_rows = ((payload.get("quoteResponse") or {}).get("result") or [])
@@ -186,6 +205,35 @@ class NSEUniverse:
             if start + batch_size < len(symbols):
                 time.sleep(self.request_delay)
         return result
+
+    def _yahoo_market_cap_summary(self, symbol: str) -> Optional[float]:
+        """Fetch market cap from Yahoo quoteSummary as a second authenticated fallback."""
+        self._init_yahoo_auth()
+        url = f"{self.YAHOO_SUMMARY_URL}/{self._yahoo_symbol(symbol)}"
+        params = {
+            "modules": "price,summaryDetail,defaultKeyStatistics",
+            "crumb": self.yahoo_crumb,
+        }
+        headers = {"Referer": "https://finance.yahoo.com/"}
+        response = self.session.get(url, params=params, headers=headers, timeout=30)
+        if response.status_code in (401, 403):
+            self._init_yahoo_auth(force=True)
+            params["crumb"] = self.yahoo_crumb
+            response = self.session.get(url, params=params, headers=headers, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        result_rows = ((payload.get("quoteSummary") or {}).get("result") or [])
+        if not result_rows:
+            return None
+        result = result_rows[0]
+        for section in (result.get("price") or {}, result.get("summaryDetail") or {}, result.get("defaultKeyStatistics") or {}):
+            market_cap = section.get("marketCap") if isinstance(section, dict) else None
+            if isinstance(market_cap, dict):
+                market_cap = market_cap.get("raw")
+            market_cap = self._first_number(market_cap)
+            if market_cap is not None:
+                return market_cap / 1e7
+        return None
 
     def quote(self, symbol: str) -> Dict[str, Any]:
         """Fetch one quote, falling back when NSE blocks automated access."""
@@ -236,13 +284,21 @@ class NSEUniverse:
             }
         except (requests.RequestException, RuntimeError):
             quote = self._yahoo_quote(symbol)
+            market_cap_source = None
             try:
                 market_caps = self._yahoo_market_caps([symbol])
                 quote["market_cap_cr"] = market_caps.get(symbol)
-                quote["source"] = "Yahoo Finance chart + quote fallback"
+                market_cap_source = "Yahoo Finance quote"
             except requests.RequestException:
-                # Keep market cap explicitly unknown rather than guessing.
-                quote["market_cap_cr"] = None
+                try:
+                    quote["market_cap_cr"] = self._yahoo_market_cap_summary(symbol)
+                    market_cap_source = "Yahoo Finance quoteSummary"
+                except requests.RequestException:
+                    quote["market_cap_cr"] = None
+            if quote["market_cap_cr"] is not None:
+                quote["source"] = f"Yahoo Finance chart + {market_cap_source} fallback"
+            else:
+                quote["source"] = "Yahoo Finance chart fallback (market cap unavailable)"
             return quote
 
     def discover(self, limit: Optional[int] = None, refresh: bool = False) -> List[Dict[str, Any]]:
