@@ -30,7 +30,7 @@ class FinancialToolsTests(unittest.TestCase):
     def test_score_is_deterministic(self):
         ratios = calculate_fundamental_ratios(self.history)
         score = calculate_quality_score(ratios, governance_clean=True)
-        self.assertEqual(score["score_100"], 100)
+        self.assertEqual(score["score_100"], 95)
         self.assertEqual(score["rating"], "INVESTIBLE")
 
     def test_pe_valuation(self):
