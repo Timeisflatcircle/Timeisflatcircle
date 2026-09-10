@@ -26,15 +26,26 @@ def analyze_candidate(
         return {**row, "status": "ERROR", "error": "Missing symbol"}
 
     try:
-        filing_data: dict[str, Any] = {"announcements": [], "pit_risk_rows": []}
+        filing_data: dict[str, Any] = {"announcements": [], "pit_risk_rows": [], "shareholding": {}}
         if live_filings:
             client = filings_client or NSECorporateFilings()
             filing_data = client.cached_risk_inputs(symbol)
 
+        # Prefer live exchange shareholding data over stale/missing Stage-1 fields.
+        promoter_holding = filing_data.get("promoter_holding_pct")
+        promoter_pledge = filing_data.get("promoter_pledge_pct")
+        promoter_change = filing_data.get("promoter_change_pct")
+        if promoter_holding is None:
+            promoter_holding = row.get("promoter_holding_pct")
+        if promoter_pledge is None:
+            promoter_pledge = row.get("promoter_pledge_pct")
+        if promoter_change is None:
+            promoter_change = row.get("promoter_change_pct")
+
         corporate = assess_corporate_risk(
-            promoter_holding_pct=row.get("promoter_holding_pct"),
-            promoter_pledge_pct=row.get("promoter_pledge_pct"),
-            promoter_change_pct=row.get("promoter_change_pct"),
+            promoter_holding_pct=promoter_holding,
+            promoter_pledge_pct=promoter_pledge,
+            promoter_change_pct=promoter_change,
             auditor_status=row.get("auditor_status"),
             related_party_risk=row.get("related_party_risk"),
             announcements=extract_announcements_from_rows(
@@ -50,6 +61,11 @@ def analyze_candidate(
                 "governance_grade": corporate.governance_grade,
                 "corporate_risk_flags": ";".join(corporate.risk_flags),
                 "corporate_data_gaps": ";".join(corporate.data_gaps),
+                "promoter_holding_pct": promoter_holding,
+                "promoter_pledge_pct": promoter_pledge,
+                "promoter_change_pct": promoter_change,
+                "shareholding_as_on": filing_data.get("shareholding", {}).get("as_on_date"),
+                "shareholding_xbrl_url": filing_data.get("shareholding", {}).get("xbrl_url"),
                 "filing_source": filing_data.get("source", "NSE"),
                 "error": "Rejected before deep analysis due to a hard corporate-risk signal",
             }
@@ -104,6 +120,11 @@ def analyze_candidate(
             "governance_grade": corporate.governance_grade,
             "corporate_risk_flags": ";".join(corporate.risk_flags),
             "corporate_data_gaps": ";".join(corporate.data_gaps),
+            "promoter_holding_pct": promoter_holding,
+            "promoter_pledge_pct": promoter_pledge,
+            "promoter_change_pct": promoter_change,
+            "shareholding_as_on": filing_data.get("shareholding", {}).get("as_on_date"),
+            "shareholding_xbrl_url": filing_data.get("shareholding", {}).get("xbrl_url"),
             "filing_source": filing_data.get("source", "NSE"),
             "pat_cagr_pct": ratios.get("PAT CAGR (%)"),
             "revenue_cagr_pct": ratios.get("Revenue CAGR (%)"),
