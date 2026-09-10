@@ -1,9 +1,9 @@
 """Live NSE corporate-filing client for governance pre-screening.
 
 Uses NSE's public corporate-announcements, PIT, and shareholding-pattern feeds.
-NSE requires a browser-like session and cookies for these endpoints, so the
-client initializes one session before requesting data. Results are cached
-locally to reduce load.
+NSE endpoints can intermittently return 403/timeouts, so the client warms the
+public filing pages first and converts temporary access failures into explicit
+DATA_GAP results instead of crashing the scanner.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from datetime import date, timedelta
 from typing import Any
 
 import requests
+from requests import RequestException
 
 
 class NSECorporateFilings:
@@ -25,13 +26,14 @@ class NSECorporateFilings:
     ANNOUNCEMENTS_PAGE = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
     SHAREHOLDING_PAGE = "https://www.nseindia.com/companies-listing/corporate-filings-shareholding-pattern"
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive",
+        "Referer": ANNOUNCEMENTS_PAGE,
     }
 
-    def __init__(self, cache_dir: str = "./data/corporate", request_delay: float = 0.25):
+    def __init__(self, cache_dir: str = "./data/corporate", request_delay: float = 0.5):
         self.cache_dir = cache_dir
         self.request_delay = request_delay
         os.makedirs(cache_dir, exist_ok=True)
@@ -42,10 +44,18 @@ class NSECorporateFilings:
     def _init_session(self) -> None:
         if self.initialized:
             return
-        response = self.session.get(self.HOME_URL, timeout=20)
-        response.raise_for_status()
-        self.session.get(self.ANNOUNCEMENTS_PAGE, timeout=20)
-        self.session.get(self.SHAREHOLDING_PAGE, timeout=20)
+
+        # The public filing pages are a more reliable bootstrap than the NSE
+        # homepage for this client. They also establish the cookies used by
+        # the filing API endpoints.
+        for page in (self.ANNOUNCEMENTS_PAGE, self.SHAREHOLDING_PAGE):
+            response = self.session.get(
+                page,
+                headers={"Referer": self.HOME_URL + "/"},
+                timeout=30,
+            )
+            response.raise_for_status()
+
         self.initialized = True
 
     @staticmethod
@@ -59,7 +69,12 @@ class NSECorporateFilings:
     def _get_json(self, url: str, params: dict[str, Any]) -> Any:
         self._init_session()
         time.sleep(self.request_delay)
-        response = self.session.get(url, params=params, timeout=30)
+        response = self.session.get(
+            url,
+            params=params,
+            headers={"Referer": self.ANNOUNCEMENTS_PAGE},
+            timeout=30,
+        )
         response.raise_for_status()
         return response.json()
 
@@ -139,12 +154,7 @@ class NSECorporateFilings:
         return self._rows(data)
 
     def shareholding(self, symbol: str) -> dict[str, Any]:
-        """Return the latest NSE shareholding-pattern snapshot.
-
-        The NSE page publishes quarterly promoter/public percentages and an
-        XBRL filing link. The endpoint/schema can evolve, so extraction is
-        deliberately tolerant and preserves the raw latest row for debugging.
-        """
+        """Return the latest NSE shareholding-pattern snapshot."""
         data = self._get_json(
             self.SHAREHOLDING_URL,
             {"index": "equities", "symbol": symbol.upper().strip()},
@@ -203,11 +213,35 @@ class NSECorporateFilings:
             "rows": ordered,
         }
 
+    def _data_gap(self, symbol: str, error: Exception) -> dict[str, Any]:
+        return {
+            "symbol": symbol.upper().strip(),
+            "announcements": [],
+            "pit": [],
+            "pit_risk_rows": [],
+            "shareholding": {
+                "symbol": symbol.upper().strip(),
+                "available": False,
+                "rows": [],
+                "data_gap": f"NSE access unavailable: {type(error).__name__}",
+            },
+            "promoter_holding_pct": None,
+            "promoter_pledge_pct": None,
+            "promoter_change_pct": None,
+            "source": "NSE corporate-announcements + NSE PIT + NSE shareholding pattern",
+            "data_gap": f"NSE corporate filing access unavailable: {type(error).__name__}: {error}",
+            "available": False,
+        }
+
     def risk_inputs(self, symbol: str, days: int = 180) -> dict[str, Any]:
-        """Collect mechanical filing signals for ``corporate_risk.assess_corporate_risk``."""
-        announcements = self.announcements(symbol, days=days)
-        pit_rows = self.pit(symbol, days=max(days, 365))
-        shareholding = self.shareholding(symbol)
+        """Collect mechanical filing signals for corporate-risk assessment."""
+        try:
+            announcements = self.announcements(symbol, days=days)
+            pit_rows = self.pit(symbol, days=max(days, 365))
+            shareholding = self.shareholding(symbol)
+        except (RequestException, ValueError) as exc:
+            return self._data_gap(symbol, exc)
+
         normalized = []
         for row in announcements:
             normalized.append(
@@ -241,6 +275,7 @@ class NSECorporateFilings:
             "promoter_pledge_pct": shareholding.get("promoter_pledge_pct"),
             "promoter_change_pct": shareholding.get("promoter_change_pct"),
             "source": "NSE corporate-announcements + NSE PIT + NSE shareholding pattern",
+            "available": True,
         }
 
     def cached_risk_inputs(self, symbol: str, days: int = 180, refresh: bool = False) -> dict[str, Any]:
