@@ -34,6 +34,26 @@ def test_shareholding_extracts_latest_promoter_and_change(monkeypatch, tmp_path)
     assert result["xbrl_url"].endswith("xbrl.xml")
 
 
+def test_shareholding_handles_nse_summary_public_val_and_chronological_order(monkeypatch, tmp_path):
+    client = NSECorporateFilings(cache_dir=str(tmp_path), request_delay=0)
+    monkeypatch.setattr(
+        client,
+        "_get_json",
+        lambda *args, **kwargs: {
+            "data": [
+                {"asOnDate": "18-DEC-2021", "public_val": "49.38", "submissionDate": "18-DEC-2021"},
+                {"asOnDate": "30-JUN-2026", "public_val": "49.52", "submissionDate": "16-JUL-2026"},
+                {"asOnDate": "31-MAR-2026", "public_val": "50.00", "submissionDate": "21-APR-2026"},
+            ]
+        },
+    )
+    result = client.shareholding("RELIANCE")
+    assert result["as_on_date"] == "30-JUN-2026"
+    assert result["promoter_holding_pct"] == 50.48
+    assert result["public_holding_pct"] == 49.52
+    assert result["promoter_change_pct"] == 0.48
+
+
 def test_risk_inputs_include_shareholding(monkeypatch, tmp_path):
     client = NSECorporateFilings(cache_dir=str(tmp_path), request_delay=0)
     monkeypatch.setattr(client, "announcements", lambda symbol, days: [])
