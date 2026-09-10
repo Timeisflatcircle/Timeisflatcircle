@@ -61,18 +61,10 @@ class NSEUniverse:
         if self.yahoo_crumb and not force:
             return
         self.yahoo_crumb = None
-        cookie_response = self.session.get(
-            self.YAHOO_COOKIE_URL,
-            headers={"Referer": "https://finance.yahoo.com/"},
-            timeout=15,
-        )
+        cookie_response = self.session.get(self.YAHOO_COOKIE_URL, headers={"Referer": "https://finance.yahoo.com/"}, timeout=15)
         if cookie_response.status_code not in (200, 404):
             cookie_response.raise_for_status()
-        crumb_response = self.session.get(
-            self.YAHOO_CRUMB_URL,
-            headers={"Referer": "https://finance.yahoo.com/"},
-            timeout=15,
-        )
+        crumb_response = self.session.get(self.YAHOO_CRUMB_URL, headers={"Referer": "https://finance.yahoo.com/"}, timeout=15)
         crumb_response.raise_for_status()
         crumb = crumb_response.text.strip()
         if not crumb or "Unauthorized" in crumb:
@@ -158,18 +150,10 @@ class NSEUniverse:
         for start in range(0, len(symbols), batch_size):
             batch = symbols[start:start + batch_size]
             yahoo_symbols = [self._yahoo_symbol(symbol) for symbol in batch]
-            response = self.session.get(
-                self.YAHOO_QUOTE_URL,
-                params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb},
-                headers={"Referer": "https://finance.yahoo.com/"}, timeout=30,
-            )
+            response = self.session.get(self.YAHOO_QUOTE_URL, params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb}, headers={"Referer": "https://finance.yahoo.com/"}, timeout=30)
             if response.status_code in (401, 403):
                 self._init_yahoo_auth(force=True)
-                response = self.session.get(
-                    self.YAHOO_QUOTE_URL,
-                    params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb},
-                    headers={"Referer": "https://finance.yahoo.com/"}, timeout=30,
-                )
+                response = self.session.get(self.YAHOO_QUOTE_URL, params={"symbols": ",".join(yahoo_symbols), "crumb": self.yahoo_crumb}, headers={"Referer": "https://finance.yahoo.com/"}, timeout=30)
             response.raise_for_status()
             for quote in ((response.json().get("quoteResponse") or {}).get("result") or []):
                 yahoo_symbol = quote.get("symbol")
@@ -227,7 +211,8 @@ class NSEUniverse:
             issued_size = self._first_number(security_info.get("issuedSize"), metadata.get("issuedSize"), data.get("issuedSize"))
             if market_cap is None and issued_size is not None and price is not None:
                 market_cap = price * issued_size / 100.0
-            if market_cap is None:
+            used_cache = market_cap is None and market_cap_override is not None
+            if used_cache:
                 market_cap = market_cap_override
             return {
                 "symbol": symbol,
@@ -235,7 +220,7 @@ class NSEUniverse:
                 "price": price,
                 "market_cap_cr": market_cap,
                 "avg_daily_value_cr": traded_value_cr,
-                "source": "NSE quote-equity" if market_cap_override is None or market_cap is not market_cap_override else "NSE quote-equity + market-cap cache",
+                "source": "NSE quote-equity + market-cap cache" if used_cache else "NSE quote-equity",
             }
         except (requests.RequestException, RuntimeError):
             quote = self._yahoo_quote(symbol)
@@ -267,8 +252,6 @@ class NSEUniverse:
         if limit:
             symbols = symbols[:limit]
 
-        # One bulk request when cache is stale/missing; subsequent per-symbol
-        # quote calls only retrieve price/liquidity and reuse the cached market cap.
         market_caps = self.market_cap_cache.ensure_fresh(symbols)
         rows: List[Dict[str, Any]] = []
         failures = 0
