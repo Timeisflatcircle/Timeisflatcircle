@@ -2,8 +2,9 @@
 
 Uses NSE's public equity master for symbols. For live price/liquidity/market-cap
 fields, NSE's quote-equity endpoint is attempted first, but the scanner also
-supports a bulk Yahoo Finance quote fallback because NSE may return HTTP 403
-to automated quote requests. The fallback avoids thousands of sequential calls.
+supports a Yahoo Finance chart fallback because NSE and Yahoo quote endpoints
+may reject automated quote requests. The chart endpoint provides current price
+and volume without the Yahoo quote-endpoint authentication flow.
 """
 
 import csv
@@ -20,10 +21,7 @@ class NSEUniverse:
     MASTER_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
     QUOTE_URL = "https://www.nseindia.com/api/quote-equity"
     HOME_URL = "https://www.nseindia.com"
-    YAHOO_QUOTE_URLS = (
-        "https://query1.finance.yahoo.com/v7/finance/quote",
-        "https://query2.finance.yahoo.com/v7/finance/quote",
-    )
+    YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -90,54 +88,69 @@ class NSEUniverse:
         return f"{symbol}.NS"
 
     def _yahoo_quote(self, symbol: str) -> Dict[str, Any]:
-        """Fetch one quote from Yahoo Finance as a fallback provider."""
+        """Fetch one current quote from Yahoo Finance's chart endpoint."""
         data = self._yahoo_quotes([symbol])
         if symbol not in data:
-            raise requests.RequestException(f"No Yahoo quote returned for {symbol}")
+            raise requests.RequestException(f"No Yahoo chart quote returned for {symbol}")
         return data[symbol]
 
     def _yahoo_quotes(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Fetch quotes in batches to avoid one HTTP request per NSE symbol."""
+        """Fetch current price/volume using Yahoo's chart endpoint.
+
+        Yahoo's /v7/finance/quote endpoint now commonly returns 401 without
+        its authentication/crumb flow, while /v8/finance/chart exposes the
+        current market price and volume in the chart metadata.
+        """
         result: Dict[str, Dict[str, Any]] = {}
-        yahoo_symbols = ",".join(self._yahoo_symbol(symbol) for symbol in symbols)
-        last_error: Optional[Exception] = None
+        for symbol in symbols:
+            yahoo_symbol = self._yahoo_symbol(symbol)
+            url = f"{self.YAHOO_CHART_URL}/{yahoo_symbol}"
+            response = self.session.get(
+                url,
+                params={"range": "1d", "interval": "1d"},
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            chart = payload.get("chart") or {}
+            chart_results = chart.get("result") or []
+            if not chart_results:
+                continue
 
-        for url in self.YAHOO_QUOTE_URLS:
-            try:
-                response = self.session.get(
-                    url,
-                    params={"symbols": yahoo_symbols},
-                    timeout=30,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                quotes = (payload.get("quoteResponse") or {}).get("result") or []
-                for quote in quotes:
-                    yahoo_symbol = str(quote.get("symbol") or "")
-                    if not yahoo_symbol.endswith(".NS"):
-                        continue
-                    symbol = yahoo_symbol[:-3]
-                    price = self._first_number(
-                        quote.get("regularMarketPrice"),
-                        quote.get("postMarketPrice"),
-                    )
-                    volume = self._first_number(quote.get("regularMarketVolume"))
-                    traded_value_cr = price * volume / 1e7 if price is not None and volume is not None else None
-                    market_cap = self._first_number(quote.get("marketCap"))
-                    result[symbol] = {
-                        "symbol": symbol,
-                        "company_name": quote.get("longName") or quote.get("shortName") or symbol,
-                        "price": price,
-                        "market_cap_cr": market_cap / 1e7 if market_cap is not None else None,
-                        "avg_daily_value_cr": traded_value_cr,
-                        "volume": volume,
-                        "source": "Yahoo Finance quote fallback",
-                    }
-                return result
-            except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
-                last_error = exc
+            data = chart_results[0]
+            meta = data.get("meta") or {}
+            price = self._first_number(
+                meta.get("regularMarketPrice"),
+                meta.get("previousClose"),
+                meta.get("chartPreviousClose"),
+            )
+            volume = None
+            indicators = data.get("indicators") or {}
+            quote_rows = indicators.get("quote") or []
+            if quote_rows:
+                volumes = quote_rows[0].get("volume") or []
+                for value in reversed(volumes):
+                    if value is not None:
+                        volume = self._first_number(value)
+                        break
 
-        raise requests.RequestException(f"Yahoo quote fallback failed: {last_error}")
+            traded_value_cr = (
+                price * volume / 1e7
+                if price is not None and volume is not None
+                else None
+            )
+            result[symbol] = {
+                "symbol": symbol,
+                "company_name": meta.get("longName") or meta.get("shortName") or symbol,
+                "price": price,
+                # Yahoo chart does not expose market cap. Keep this explicitly
+                # unknown rather than inventing a value.
+                "market_cap_cr": None,
+                "avg_daily_value_cr": traded_value_cr,
+                "volume": volume,
+                "source": "Yahoo Finance chart fallback",
+            }
+        return result
 
     def quote(self, symbol: str) -> Dict[str, Any]:
         """Fetch one quote, falling back when NSE blocks automated access."""
@@ -190,7 +203,7 @@ class NSEUniverse:
             return self._yahoo_quote(symbol)
 
     def discover(self, limit: Optional[int] = None, refresh: bool = False) -> List[Dict[str, Any]]:
-        """Build a current market universe using bulk quote fallback when needed."""
+        """Build a current market universe using quote fallback when needed."""
         cache_path = os.path.join(self.cache_dir, "nse_universe.json")
         if os.path.exists(cache_path) and not refresh:
             with open(cache_path, "r", encoding="utf-8") as fh:
@@ -202,26 +215,12 @@ class NSEUniverse:
 
         rows: List[Dict[str, Any]] = []
         failures = 0
-        batch_size = 50
-        for start in range(0, len(symbols), batch_size):
-            batch = symbols[start:start + batch_size]
+        for idx, symbol in enumerate(symbols, 1):
             try:
-                batch_rows = self._yahoo_quotes(batch)
-                for symbol in batch:
-                    row = batch_rows.get(symbol)
-                    if row is not None:
-                        rows.append(row)
-                    else:
-                        failures += 1
-            except requests.RequestException:
-                # If Yahoo bulk quotes fail, fall back to individual provider attempts.
-                for symbol in batch:
-                    try:
-                        rows.append(self.quote(symbol))
-                    except (requests.RequestException, RuntimeError, ValueError, TypeError, KeyError):
-                        failures += 1
-                    time.sleep(self.request_delay)
-            if start + batch_size < len(symbols):
+                rows.append(self.quote(symbol))
+            except (requests.RequestException, RuntimeError, ValueError, TypeError, KeyError):
+                failures += 1
+            if idx < len(symbols):
                 time.sleep(self.request_delay)
 
         payload = {
