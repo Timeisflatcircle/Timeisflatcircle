@@ -10,7 +10,8 @@ __pycache__/
 .env
 *.env
 
-# Ignore downloaded reports and outputs
+# Ignore generated market/universe caches, downloaded reports and outputs
+data/universe/*.json
 data/downloads/
 outputs/
 *.pdf
