@@ -10,6 +10,7 @@ import csv
 import io
 import json
 import os
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -242,17 +243,48 @@ class NSEUniverse:
             quote["source"] = f"Yahoo Finance chart + {market_cap_source} fallback" if quote["market_cap_cr"] is not None else "Yahoo Finance chart fallback (market cap unavailable)"
             return quote
 
-    def discover(self, limit: Optional[int] = None, refresh: bool = False) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _print_progress(current: int, total: int, started_at: float, failures: int) -> None:
+        """Render a compact terminal progress bar with percentage and ETA."""
+        if total <= 0:
+            return
+        elapsed = max(time.monotonic() - started_at, 0.001)
+        rate = current / elapsed
+        remaining = max(total - current, 0)
+        eta_seconds = remaining / rate if rate > 0 else 0
+        width = 30
+        filled = int(width * current / total)
+        bar = "#" * filled + "-" * (width - filled)
+        eta_min, eta_sec = divmod(int(eta_seconds), 60)
+        message = f"\rScanning universe [{bar}] {current}/{total} ({current / total * 100:5.1f}%) | ETA {eta_min:02d}:{eta_sec:02d} | failures {failures}"
+        print(message, end="", flush=True)
+        if current == total:
+            print()
+
+    def discover(self, limit: Optional[int] = None, refresh: bool = False,
+                 progress: bool = True) -> List[Dict[str, Any]]:
         cache_path = os.path.join(self.cache_dir, "nse_universe.json")
         if os.path.exists(cache_path) and not refresh:
+            if progress:
+                print("Universe cache found; use refresh=True for a new scan.")
             with open(cache_path, "r", encoding="utf-8") as fh:
                 return json.load(fh)
 
         symbols = self.symbols()
         if limit:
             symbols = symbols[:limit]
+        total = len(symbols)
+        started_at = time.monotonic()
 
+        if progress:
+            print(f"Universe scan started: {total} symbols")
+            print("Refreshing bulk market-cap cache...")
         market_caps = self.market_cap_cache.ensure_fresh(symbols)
+        if progress:
+            cached_count = sum(1 for symbol in symbols if market_caps.get(symbol, {}).get("market_cap_cr") is not None)
+            print(f"Market-cap cache ready: {cached_count}/{total} symbols have market caps")
+            print("Scanning price/liquidity data...")
+
         rows: List[Dict[str, Any]] = []
         failures = 0
         for idx, symbol in enumerate(symbols, 1):
@@ -262,15 +294,20 @@ class NSEUniverse:
                 rows.append(self.quote(symbol, market_cap_override=override))
             except (requests.RequestException, RuntimeError, ValueError, TypeError, KeyError):
                 failures += 1
-            if idx < len(symbols):
+            if progress:
+                self._print_progress(idx, total, started_at, failures)
+            if idx < total:
                 time.sleep(self.request_delay)
 
         payload = {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "symbols_requested": len(symbols),
+            "symbols_requested": total,
             "quote_failures": failures,
             "rows": rows,
         }
         with open(cache_path, "w", encoding="utf-8") as fh:
             json.dump(payload["rows"], fh, indent=2)
+        if progress:
+            elapsed = time.monotonic() - started_at
+            print(f"Universe scan complete: {len(rows)}/{total} quotes in {elapsed / 60:.1f} min")
         return rows
