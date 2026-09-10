@@ -80,4 +80,4 @@ def test_quote_fallback_enriches_market_cap(monkeypatch):
     row = universe.quote("RELIANCE")
 
     assert row["market_cap_cr"] == 1720000.0
-    assert row["source"] == "Yahoo Finance chart + quote fallback"
+    assert row["source"] == "Yahoo Finance chart + Yahoo Finance quote fallback"
