@@ -39,11 +39,7 @@ class NSEUniverse:
         self.initialized = False
 
     def _init_session(self) -> None:
-        """Initialize an NSE web session when the homepage is accessible.
-
-        NSE can return HTTP 403 to automated clients. Callers should treat this
-        as a provider-unavailable condition and use the bulk fallback.
-        """
+        """Initialize an NSE web session when the homepage is accessible."""
         if self.initialized:
             return
         try:
@@ -125,15 +121,16 @@ class NSEUniverse:
                         quote.get("regularMarketPrice"),
                         quote.get("postMarketPrice"),
                     )
-                    traded_value = self._first_number(quote.get("regularMarketVolume"))
+                    volume = self._first_number(quote.get("regularMarketVolume"))
+                    traded_value_cr = price * volume / 1e7 if price is not None and volume is not None else None
                     market_cap = self._first_number(quote.get("marketCap"))
                     result[symbol] = {
                         "symbol": symbol,
                         "company_name": quote.get("longName") or quote.get("shortName") or symbol,
                         "price": price,
                         "market_cap_cr": market_cap / 1e7 if market_cap is not None else None,
-                        "avg_daily_value_cr": None,
-                        "volume": traded_value,
+                        "avg_daily_value_cr": traded_value_cr,
+                        "volume": volume,
                         "source": "Yahoo Finance quote fallback",
                     }
                 return result
