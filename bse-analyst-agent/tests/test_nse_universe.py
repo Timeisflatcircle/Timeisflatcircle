@@ -18,20 +18,9 @@ class FakeResponse:
 def test_yahoo_chart_quote_parses_price_and_volume():
     universe = NSEUniverse()
     universe.session.get = lambda *args, **kwargs: FakeResponse({
-        "chart": {
-            "result": [{
-                "meta": {
-                    "regularMarketPrice": 1274.0,
-                    "regularMarketVolume": 9290437,
-                    "longName": "Reliance Industries Limited",
-                },
-                "indicators": {"quote": [{"volume": [9290437]}]},
-            }]
-        }
+        "chart": {"result": [{"meta": {"regularMarketPrice": 1274.0, "regularMarketVolume": 9290437, "longName": "Reliance Industries Limited"}, "indicators": {"quote": [{"volume": [9290437]}]}}]}
     })
-
     row = universe._yahoo_quote("RELIANCE")
-
     assert row["price"] == 1274.0
     assert row["volume"] == 9290437.0
     assert row["company_name"] == "Reliance Industries Limited"
@@ -41,44 +30,48 @@ def test_yahoo_chart_quote_parses_price_and_volume():
 def test_yahoo_market_caps_converts_inr_to_crore(monkeypatch):
     universe = NSEUniverse()
     universe.yahoo_crumb = "crumb"
-
     calls = []
 
     def fake_get(url, **kwargs):
         calls.append((url, kwargs))
-        return FakeResponse({
-            "quoteResponse": {
-                "result": [
-                    {"symbol": "RELIANCE.NS", "marketCap": 17200000000000},
-                    {"symbol": "TCS.NS", "marketCap": 15000000000000},
-                ]
-            }
-        })
+        return FakeResponse({"quoteResponse": {"result": [{"symbol": "RELIANCE.NS", "marketCap": 17200000000000}, {"symbol": "TCS.NS", "marketCap": 15000000000000}]}})
 
     monkeypatch.setattr(universe.session, "get", fake_get)
     result = universe._yahoo_market_caps(["RELIANCE", "TCS"])
-
     assert result["RELIANCE"] == 1720000.0
     assert result["TCS"] == 1500000.0
+    assert calls[0][1]["params"]["crumb"] == "crumb"
+
+
+def test_yahoo_quote_batch_parses_price_volume_and_market_cap(monkeypatch):
+    universe = NSEUniverse()
+    universe.yahoo_crumb = "crumb"
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse({"quoteResponse": {"result": [
+            {"symbol": "RELIANCE.NS", "regularMarketPrice": 1274, "regularMarketVolume": 9290437, "longName": "Reliance Industries Limited", "marketCap": 17200000000000},
+            {"symbol": "TCS.NS", "regularMarketPrice": 3200, "regularMarketVolume": 1000000, "shortName": "Tata Consultancy Services", "marketCap": 15000000000000},
+        ]}})
+
+    monkeypatch.setattr(universe.session, "get", fake_get)
+    result = universe._yahoo_quote_batch(["RELIANCE", "TCS"])
+    assert set(result) == {"RELIANCE", "TCS"}
+    assert result["RELIANCE"]["price"] == 1274.0
+    assert result["RELIANCE"]["volume"] == 9290437.0
+    assert result["RELIANCE"]["market_cap_cr"] == 1720000.0
+    assert result["TCS"]["company_name"] == "Tata Consultancy Services"
+    assert calls[0][1]["params"]["symbols"] == "RELIANCE.NS,TCS.NS"
     assert calls[0][1]["params"]["crumb"] == "crumb"
 
 
 def test_quote_fallback_enriches_market_cap(monkeypatch):
     universe = NSEUniverse()
     monkeypatch.setattr(universe, "_init_session", lambda: (_ for _ in ()).throw(RuntimeError("NSE blocked")))
-    monkeypatch.setattr(universe, "_yahoo_quote", lambda symbol: {
-        "symbol": symbol,
-        "company_name": "Reliance Industries Limited",
-        "price": 1274.0,
-        "market_cap_cr": None,
-        "avg_daily_value_cr": 1183.6,
-        "volume": 9290437.0,
-        "source": "Yahoo Finance chart fallback",
-    })
+    monkeypatch.setattr(universe, "_yahoo_quote", lambda symbol: {"symbol": symbol, "company_name": "Reliance Industries Limited", "price": 1274.0, "market_cap_cr": None, "avg_daily_value_cr": 1183.6, "volume": 9290437.0, "source": "Yahoo Finance chart fallback"})
     monkeypatch.setattr(universe, "_yahoo_market_caps", lambda symbols: {"RELIANCE": 1720000.0})
-
     row = universe.quote("RELIANCE")
-
     assert row["market_cap_cr"] == 1720000.0
     assert row["source"] == "Yahoo Finance chart + Yahoo Finance quote fallback"
 
@@ -86,20 +79,10 @@ def test_quote_fallback_enriches_market_cap(monkeypatch):
 def test_quote_uses_bulk_market_cap_override_without_second_market_cap_request(monkeypatch):
     universe = NSEUniverse()
     monkeypatch.setattr(universe, "_init_session", lambda: (_ for _ in ()).throw(RuntimeError("NSE blocked")))
-    monkeypatch.setattr(universe, "_yahoo_quote", lambda symbol: {
-        "symbol": symbol,
-        "company_name": "Reliance Industries Limited",
-        "price": 1274.0,
-        "market_cap_cr": None,
-        "avg_daily_value_cr": 1183.6,
-        "volume": 9290437.0,
-        "source": "Yahoo Finance chart fallback",
-    })
+    monkeypatch.setattr(universe, "_yahoo_quote", lambda symbol: {"symbol": symbol, "company_name": "Reliance Industries Limited", "price": 1274.0, "market_cap_cr": None, "avg_daily_value_cr": 1183.6, "volume": 9290437.0, "source": "Yahoo Finance chart fallback"})
     called = []
     monkeypatch.setattr(universe, "_yahoo_market_caps", lambda symbols: called.append(symbols) or {"RELIANCE": 1720000.0})
-
     row = universe.quote("RELIANCE", market_cap_override=1720000.0)
-
     assert row["market_cap_cr"] == 1720000.0
     assert row["source"] == "Yahoo Finance chart + market-cap cache"
     assert called == []
