@@ -1,5 +1,6 @@
 import csv
 import os
+from collections import Counter
 from typing import Any, Dict, List
 
 from src.nse_downloader import NSEDownloader
@@ -15,6 +16,33 @@ from src.corporate_risk import assess_corporate_risk, extract_announcements_from
 from src.nse_corporate_filings import NSECorporateFilings
 
 
+ANALYZED_REQUIRED_FIELDS = (
+    "verdict",
+    "quality_score",
+    "ai_conviction",
+    "thesis",
+)
+
+
+def _write_results_csv(results: List[Dict[str, Any]], path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fields = sorted({key for row in results for key in row.keys()})
+    if not fields:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(results)
+
+
+def _is_complete_analysis(result: Dict[str, Any]) -> bool:
+    """Only count a row as fully analyzed when the final research payload exists."""
+    return (
+        result.get("status") == "ANALYZED"
+        and all(result.get(field) not in (None, "") for field in ANALYZED_REQUIRED_FIELDS)
+    )
+
+
 def analyze_candidate(
     row: Dict[str, Any],
     orchestrator: AnalysisOrchestrator | None = None,
@@ -23,7 +51,7 @@ def analyze_candidate(
 ) -> Dict[str, Any]:
     symbol = str(row.get("symbol", "")).strip().upper()
     if not symbol:
-        return {**row, "status": "ERROR", "error": "Missing symbol"}
+        return {**row, "status": "ERROR", "stage": "INPUT", "error": "Missing symbol"}
 
     try:
         filing_data: dict[str, Any] = {"announcements": [], "pit_risk_rows": [], "shareholding": {}}
@@ -31,7 +59,6 @@ def analyze_candidate(
             client = filings_client or NSECorporateFilings()
             filing_data = client.cached_risk_inputs(symbol)
 
-        # Prefer live exchange shareholding data over stale/missing Stage-1 fields.
         promoter_holding = filing_data.get("promoter_holding_pct")
         promoter_pledge = filing_data.get("promoter_pledge_pct")
         promoter_change = filing_data.get("promoter_change_pct")
@@ -56,6 +83,7 @@ def analyze_candidate(
             return {
                 **row,
                 "status": "CORPORATE_RISK_REJECT",
+                "stage": "CORPORATE_RISK",
                 "verdict": "AVOID",
                 "corporate_risk_score": corporate.risk_score,
                 "governance_grade": corporate.governance_grade,
@@ -72,7 +100,7 @@ def analyze_candidate(
 
         pdf_path = NSEDownloader().download_report(symbol)
         if not pdf_path:
-            return {**row, "status": "NO_REPORT", "error": "Annual report unavailable"}
+            return {**row, "status": "NO_REPORT", "stage": "FILING", "error": "Annual report unavailable"}
 
         parser = FinancialDocParser(pdf_path)
         sections = parser.extract_critical_sections()
@@ -108,9 +136,10 @@ def analyze_candidate(
         memo = ai.run_investment_committee(forensics, ratios, quality, valuation)
         recommendation = determine_final_recommendation(quality, ratios, governance_clean, valuation)
 
-        return {
+        result = {
             **row,
             "status": "ANALYZED",
+            "stage": "COMPLETE",
             "verdict": recommendation["verdict"],
             "decision_reason": recommendation["reason"],
             "quality_score": quality["score_100"],
@@ -130,15 +159,28 @@ def analyze_candidate(
             "revenue_cagr_pct": ratios.get("Revenue CAGR (%)"),
             "roce_pct": ratios.get("ROCE (%)"),
             "roe_pct": ratios.get("ROE (%)"),
-            "cfo_pat": ratios.get("CFO/PAT"),
-            "debt_equity": ratios.get("Debt/Equity"),
+            "cfo_pat": ratios.get("CFO / PAT Quality Ratio"),
+            "debt_equity": ratios.get("Debt to Equity"),
             "fair_value": valuation.get("fair_value"),
             "buy_below": valuation.get("buy_below"),
             "risk_flags": ";".join(forensics.forensic_red_flags or []),
             "thesis": memo.executive_summary.strip(),
         }
+        if not _is_complete_analysis(result):
+            return {
+                **result,
+                "status": "ERROR",
+                "stage": "VALIDATION",
+                "error": "Analysis returned an incomplete final payload",
+            }
+        return result
     except Exception as exc:
-        return {**row, "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            **row,
+            "status": "ERROR",
+            "stage": "EXCEPTION",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def run_deep_scan(
@@ -156,23 +198,44 @@ def run_deep_scan(
 
     ai = AnalysisOrchestrator()
     filings = NSECorporateFilings() if live_filings else None
-    results = [analyze_candidate(row, ai, filings, live_filings=live_filings) for row in rows]
-    analyzed = [r for r in results if r.get("status") == "ANALYZED"]
-    analyzed.sort(key=lambda r: (r.get("verdict") == "BUY", float(r.get("quality_score") or 0), float(r.get("ai_conviction") or 0)), reverse=True)
-    selected = analyzed[:top]
-
-    os.makedirs(output_dir, exist_ok=True)
+    results: List[Dict[str, Any]] = []
     path = os.path.join(output_dir, "small_microcap_deep_analysis.csv")
-    fields = sorted({key for row in results for key in row.keys()})
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(results)
 
-    print(f"[+] Stage-2 candidates processed: {len(rows)}")
+    print(f"[*] Stage-2 starting: {len(rows)} candidates | live filings={'ON' if live_filings else 'OFF'}")
+    for index, row in enumerate(rows, 1):
+        symbol = str(row.get("symbol", "")).strip().upper() or "<missing>"
+        print(f"\n[*] Stage-2 {index}/{len(rows)}: {symbol}")
+        result = analyze_candidate(row, ai, filings, live_filings=live_filings)
+        results.append(result)
+        status = result.get("status", "UNKNOWN")
+        print(f"    -> {status} | stage={result.get('stage', '')} | {result.get('error', '')}")
+        _write_results_csv(results, path)
+
+    analyzed = [r for r in results if _is_complete_analysis(r)]
+    analyzed.sort(
+        key=lambda r: (
+            r.get("verdict") == "BUY",
+            float(r.get("quality_score") or 0),
+            float(r.get("ai_conviction") or 0),
+        ),
+        reverse=True,
+    )
+    selected = analyzed[:top]
+    counts = Counter(r.get("status", "UNKNOWN") for r in results)
+
+    print(f"\n[+] Stage-2 candidates processed: {len(rows)}")
     print(f"[+] Stage-2 fully analyzed: {len(analyzed)}")
+    print("[+] Stage-2 status summary: " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    if counts.get("ERROR"):
+        print("[!] Error details:")
+        for result in results:
+            if result.get("status") == "ERROR":
+                print(f"    - {result.get('symbol', '<missing>')}: {result.get('stage')} -> {result.get('error')}")
+    if counts.get("CORPORATE_RISK_REJECT"):
+        print("[!] Corporate-risk rejects are intentionally excluded from 'fully analyzed'.")
+
     print(f"[+] Live NSE filing checks: {'ON' if live_filings else 'OFF'}")
-    print(f"[+] Saved full deep-analysis results: {path}")
+    print(f"[+] Saved checkpoint/final deep-analysis results: {path}")
     print("\nTOP SMALL/MICRO-CAP RESEARCH SHORTLIST")
     print("-" * 110)
     for i, row in enumerate(selected, 1):
