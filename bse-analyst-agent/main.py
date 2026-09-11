@@ -16,6 +16,7 @@ from src.financial_tools import calculate_fundamental_ratios, calculate_quality_
 from src.agent import AnalysisOrchestrator
 from src.nse_universe import NSEUniverse
 from src.smallcap_scanner import SmallMicrocapConfig, classify_market_cap
+from src.candidate_ranker import rank_for_deep_analysis
 from src.deep_scanner import run_deep_scan
 
 
@@ -63,7 +64,7 @@ def save_summary_to_notepad(symbol, forensics, ratios, quality, valuation, recom
 
 
 def run_universe_scan(refresh=False, top=50, limit=None, output_dir="./outputs"):
-    """Stage 1: exchange-level discovery only; not an investment recommendation."""
+    """Stage 1: fast universe discovery plus deterministic pre-deep prioritization."""
     cfg = SmallMicrocapConfig(); universe = NSEUniverse()
     print("\n[*] Discovering NSE equity universe...")
     rows = universe.discover(limit=limit, refresh=refresh); candidates = []
@@ -74,14 +75,17 @@ def run_universe_scan(refresh=False, top=50, limit=None, output_dir="./outputs")
         if category not in ("MICROCAP", "SMALLCAP"): continue
         if float(price) < cfg.min_price or float(traded_value) < cfg.min_daily_traded_value_cr: continue
         candidates.append({**row, "market_cap_category": category})
-    candidates.sort(key=lambda x: (0 if x["market_cap_category"] == "MICROCAP" else 1, -float(x["market_cap_cr"]), -float(x["avg_daily_value_cr"])))
-    selected = candidates[:top]; os.makedirs(output_dir, exist_ok=True); path = os.path.join(output_dir, "small_microcap_universe.csv")
+
+    ranked = rank_for_deep_analysis(candidates, deep_limit=max(top, 1))
+    selected = ranked[:top]
+    os.makedirs(output_dir, exist_ok=True); path = os.path.join(output_dir, "small_microcap_universe.csv")
     with open(path, "w", newline="", encoding="utf-8") as fh:
-        fields = ["symbol", "company_name", "market_cap_category", "market_cap_cr", "price", "avg_daily_value_cr", "source"]
+        fields = ["symbol", "company_name", "market_cap_category", "market_cap_cr", "price", "avg_daily_value_cr", "pre_deep_score", "source"]
         writer = csv.DictWriter(fh, fieldnames=fields); writer.writeheader(); writer.writerows({k: row.get(k) for k in fields} for row in selected)
-    print(f"[+] NSE rows collected: {len(rows)}"); print(f"[+] Candidates passing market/liquidity filters: {len(candidates)}"); print(f"[+] Saved top {len(selected)} candidates to: {path}")
-    print("\nTOP CANDIDATES — Stage 1 only (NOT investment recommendations)"); print("-" * 95)
-    for i, row in enumerate(selected, 1): print(f"{i:>2}. {row['symbol']:<15} {row['market_cap_category']:<9} MCap ₹{float(row['market_cap_cr']):>9.0f} Cr  Price ₹{float(row['price']):>8.2f}  Traded ₹{float(row['avg_daily_value_cr']):>7.2f} Cr")
+    print(f"[+] NSE rows collected: {len(rows)}"); print(f"[+] Candidates passing market/liquidity filters: {len(candidates)}"); print(f"[+] Pre-deep ranked shortlist: {len(selected)}")
+    print(f"[+] Saved top {len(selected)} candidates to: {path}")
+    print("\nTOP CANDIDATES — Stage 1 prioritization only (NOT investment recommendations)"); print("-" * 110)
+    for i, row in enumerate(selected, 1): print(f"{i:>2}. {row['symbol']:<15} {row['market_cap_category']:<9} Score {row['pre_deep_score']:>6.2f}  MCap ₹{float(row['market_cap_cr']):>9.0f} Cr  Traded ₹{float(row['avg_daily_value_cr']):>7.2f} Cr")
     return selected
 
 
